@@ -177,7 +177,7 @@ private struct CameraSettingsTab: View {
         switch activator.state {
         case .on: return Theme.Color.success
         case .activating, .needsApproval: return Theme.Color.warn
-        case .failed, .requiresRelaunch: return Theme.Color.error
+        case .failed, .requiresRelaunch, .requiresReboot: return Theme.Color.error
         case .off: return .secondary
         }
     }
@@ -190,6 +190,7 @@ private struct CameraSettingsTab: View {
         case .on: return "Active"
         case .failed(let msg): return "Failed: \(msg)"
         case .requiresRelaunch: return "Restart required"
+        case .requiresReboot: return "Mac restart required"
         }
     }
 
@@ -217,6 +218,8 @@ private struct CameraSettingsTab: View {
             return "Activation didn't complete. Open System Settings → General → Login Items & Extensions to check the extension's state, then toggle this off and on to retry."
         case .requiresRelaunch:
             return "macOS holds the virtual camera in a stale state after toggling off and back on inside one session. Restart the app to re-enable it cleanly."
+        case .requiresReboot:
+            return "A previous version of the camera extension is still queued for removal, and macOS won't publish the new one until that finishes. Restart your Mac to complete the swap — restarting the app won't help."
         }
     }
 
