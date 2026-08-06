@@ -57,6 +57,19 @@ universal format support. v0.1.x will keep getting patch releases
 in parallel for anyone who doesn't need any of this. **Money.**
 ```
 
+### Transient USB devices no longer trigger the new-location prompt (2026-08-05)
+
+Plugging in a lone flash drive (or card reader, or a phone on a charge cable) used to fire the full "New location detected" flow — toast, menu badge, the works — because the unknown-location signal counted *any* USB device as evidence of being somewhere new. Now `handleUnknownLocation` classifies each attached device by its USB class data and subtracts the transient ones before deciding; if nothing location-worthy remains, it stays quiet.
+
+Design notes:
+
+- **Denylist, not allowlist.** We filter classes we positively recognize as transient (Mass Storage 0x08, Still Image/PTP 0x06) rather than requiring an AV device to be present. A dock that routes audio over HDMI/DisplayPort exposes zero USB AV devices — an allowlist would have silently stopped prompting at exactly the setups the app exists for. Unclassifiable devices fail open to prompting.
+- **Vendor-specific (0xFF) is discounted, not denylisted.** An iPhone exposes PTP *plus* a vendor-specific usbmux interface; a strict subset rule would count it as signal. A purely-vendor-specific device still fails open.
+- **Class data rides `NamedUSBDevice`** (new `usbClasses` field, populated from `bDeviceClass` + child `IOUSBHostInterface` `bInterfaceClass` entries), keeping `USBDevice` — the Hashable fingerprint identity — untouched. Engine, resolver, and matching are unchanged; only the prompt layer filters.
+- **Ignore keys are now computed on the filtered set**, so "dock" and "dock + USB stick left in the port" dismiss as one location. Entries persisted before this change are still honored via a legacy full-set key lookup — no migration.
+
+IOKit finding worth keeping: `IOUSBHostInterface` entries are immediate children of `IOUSBHostDevice` in the service plane, so a one-level `IORegistryEntryGetChildIterator` walk suffices; composite devices report `bDeviceClass` 0x00/0xEF, which carry no signal and are dropped.
+
 ### Profiles tab adopts the grouped-Form chrome (2026-05-18)
 
 The Profiles tab in Settings was the last surface still using `List` with `.listStyle(.inset)` — General, Camera, and Stats all render `Form(.grouped)` with rounded-card section chrome and prominent bold-icon + bold-text Section headers. Switched Profiles over to match. Apple's own System Settings renders list-style content (Login Items, Wi-Fi, Extensions) inside the same grouped-Form chrome, so the tab now reads as part of the same settings surface instead of drifting into List's sidebar aesthetic.

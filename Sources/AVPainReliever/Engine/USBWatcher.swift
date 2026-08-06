@@ -20,11 +20,23 @@ public struct NamedUSBDevice: Hashable, Sendable, Identifiable {
     /// disambiguate multi-function-device hub legs that share the
     /// same product label.
     public let vendorName: String?
+    /// USB class codes observed on the device: `bDeviceClass` (when
+    /// it's a meaningful value — `0x00` "per-interface" and `0xEF`
+    /// "miscellaneous/IAD" are omitted) plus every child interface's
+    /// `bInterfaceClass`. Empty when IOKit exposes no class data.
+    /// Drives `isLocationSignal`; see `LocationSignal.swift`.
+    public let usbClasses: Set<Int>
 
-    public init(device: USBDevice, name: String?, vendorName: String? = nil) {
+    public init(
+        device: USBDevice,
+        name: String?,
+        vendorName: String? = nil,
+        usbClasses: Set<Int> = []
+    ) {
         self.device = device
         self.name = name
         self.vendorName = vendorName
+        self.usbClasses = usbClasses
     }
 
     public var id: USBDevice { device }
@@ -159,7 +171,8 @@ public final class IOKitUSBWatcher: USBWatcher {
             named.append(NamedUSBDevice(
                 device: device,
                 name: Self.productName(entry),
-                vendorName: Self.vendorName(entry)
+                vendorName: Self.vendorName(entry),
+                usbClasses: Self.usbClasses(entry)
             ))
         }
         // Sort for stable UI ordering (IOKit doesn't guarantee an
@@ -334,6 +347,33 @@ public final class IOKitUSBWatcher: USBWatcher {
             return nil
         }
         return raw.takeRetainedValue() as? String
+    }
+
+    /// Collect the device's USB class codes: `bDeviceClass` when it
+    /// carries real signal, plus each child `IOUSBHostInterface`'s
+    /// `bInterfaceClass`. Composite devices report `bDeviceClass` as
+    /// `0x00` ("look at the interfaces") or `0xEF` (misc/IAD wrapper)
+    /// — neither says anything about what the device *is*, so both
+    /// are dropped rather than polluting the classifier's input.
+    private static func usbClasses(_ entry: io_object_t) -> Set<Int> {
+        var classes: Set<Int> = []
+        if let deviceClass = intProperty(entry, "bDeviceClass"),
+           deviceClass != 0x00, deviceClass != 0xEF {
+            classes.insert(deviceClass)
+        }
+        var childIter: io_iterator_t = 0
+        guard IORegistryEntryGetChildIterator(entry, kIOServicePlane, &childIter) == KERN_SUCCESS else {
+            return classes
+        }
+        defer { IOObjectRelease(childIter) }
+        drain(childIter) { child in
+            guard IOObjectConformsTo(child, "IOUSBHostInterface") != 0,
+                  let interfaceClass = intProperty(child, "bInterfaceClass") else {
+                return
+            }
+            classes.insert(interfaceClass)
+        }
+        return classes
     }
 
     private static func vendorName(_ entry: io_object_t) -> String? {

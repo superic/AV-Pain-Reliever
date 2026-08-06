@@ -56,7 +56,7 @@ The first time you launch, the welcome window walks you through capturing the do
 
 Repeat once per location. The app switches automatically whenever you dock there.
 
-When you connect to a new dock the app doesn't recognise, the menu bar shows **"New location"** and offers to set it up.
+When you connect to a new dock the app doesn't recognise, the menu bar shows **"New location"** and offers to set it up. Plugging in a flash drive, card reader, or phone on its own doesn't count — the app only suggests a new location for devices that could actually be part of one.
 
 ---
 
