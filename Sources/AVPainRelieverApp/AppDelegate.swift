@@ -62,17 +62,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var availableProfiles: [Profile] = []
 
     /// True when the engine resolved to the empty-fingerprint fallback
-    /// profile (e.g. "Laptop") AND the user has USB devices attached.
-    /// That state means the user is plugged into hardware we don't
-    /// have a profile for — the menu should make this visible (the
-    /// fallback profile name alone is misleading: it implies "I'm
-    /// undocked" when the user is actually at a new dock).
+    /// profile (e.g. "Laptop") AND the user has location-signal USB
+    /// devices attached (transient plug-ins like flash drives don't
+    /// count — see `NamedUSBDevice.isLocationSignal`). That state
+    /// means the user is plugged into hardware we don't have a
+    /// profile for — the menu should make this visible (the fallback
+    /// profile name alone is misleading: it implies "I'm undocked"
+    /// when the user is actually at a new dock).
     @Published var atUnknownLocation: Bool = false
 
     /// Snapshot of attached USB devices the last time the engine
-    /// surfaced an unknown-location signal. Used by the wizard's
-    /// quick-add path so a user clicking "Set Up This Location" from
-    /// the menu lands in the form with the right devices selected.
+    /// surfaced an unknown-location signal, filtered to
+    /// location-signal devices (transient plug-ins like flash drives
+    /// are excluded — see `NamedUSBDevice.isLocationSignal`). Used by
+    /// the wizard's quick-add path so a user clicking "Set Up This
+    /// Location" from the menu lands in the form with the right
+    /// devices selected, and by "Not a Location" to persist the
+    /// dismissed fingerprint.
     @Published var lastUnknownDevices: Set<USBDevice> = []
 
     /// Named-device snapshot taken at unknown-location signal time.
@@ -531,13 +537,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     private func handleUnknownLocation(devices: Set<USBDevice>) {
+        // Enumerate names + USB classes *now* so a later
+        // "Not a Location" click doesn't race with the user
+        // unplugging — see `lastUnknownDevicesNamed` doc comment.
+        // Filter to the engine-reported set so we don't accidentally
+        // persist devices that weren't part of the unknown
+        // fingerprint (the IOKit re-enumeration runs against the
+        // live system, which is a superset only on race conditions
+        // but cheap to guard against).
+        let nameWatcher = IOKitUSBWatcher(logger: ConsoleLogger(category: "unknown-location-watcher"))
+        let named = nameWatcher.currentDevicesNamed().filter { devices.contains($0.device) }
+
+        // Transient devices (flash drives, phones — see
+        // `NamedUSBDevice.isLocationSignal`) don't count as evidence
+        // of a new location. If nothing signal-worthy remains, the
+        // user just plugged in a USB stick, not moved desks — stay
+        // quiet.
+        let signalNamed = named.filter(\.isLocationSignal)
+        if signalNamed.isEmpty {
+            logger.debug("handleUnknownLocation: \(devices.count) device(s), none location-signal — suppressing UI")
+            clearUnknownLocationState()
+            return
+        }
+        let signalDevices = Set(signalNamed.map(\.device))
+
         // Honor the user's prior dismissal. Pre-existing entries on
         // the ignored list short-circuit before we touch any UI
-        // state, so a known-uninteresting device set (phone on the
-        // couch, random USB stick) never resurrects the menu prompt
-        // or the toast on subsequent plug-ins.
-        let key = LocationFingerprint.canonical(for: devices)
-        if settings.isLocationIgnored(key: key) {
+        // state, so a known-uninteresting device set never
+        // resurrects the menu prompt or the toast on subsequent
+        // plug-ins. Keyed on the signal subset so "dock" and
+        // "dock + USB stick left in the port" dismiss as one
+        // location; the full-set key is also checked so entries
+        // persisted before transient filtering existed keep working.
+        let key = LocationFingerprint.canonical(for: signalDevices)
+        let legacyKey = LocationFingerprint.canonical(for: devices)
+        if settings.isLocationIgnored(key: key) || settings.isLocationIgnored(key: legacyKey) {
             logger.debug("handleUnknownLocation: ignored fingerprint \(key) — suppressing UI")
             clearUnknownLocationState()
             return
@@ -547,17 +581,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // location even if we've already toasted about it. Setting
         // these every time is cheap and keeps the menu accurate.
         atUnknownLocation = true
-        lastUnknownDevices = devices
-        // Capture names *now* so a later "Not a Location" click
-        // doesn't race with the user unplugging — see
-        // `lastUnknownDevicesNamed` doc comment. Filter to the
-        // engine-reported set so we don't accidentally persist
-        // names for devices that weren't part of the unknown
-        // fingerprint (the IOKit re-enumeration runs against the
-        // live system, which is a superset only on race conditions
-        // but cheap to guard against).
-        let nameWatcher = IOKitUSBWatcher(logger: ConsoleLogger(category: "unknown-location-watcher"))
-        lastUnknownDevicesNamed = nameWatcher.currentDevicesNamed().filter { devices.contains($0.device) }
+        lastUnknownDevices = signalDevices
+        lastUnknownDevicesNamed = signalNamed
 
         // One toast per "stretch of unknown-ness" — re-armed when the
         // user resolves to a specific profile. Avoids spamming when
@@ -568,7 +593,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
         notifier.notify(
             title: "New location detected",
-            body: NotificationCopy.unknownLocationBody(deviceCount: devices.count),
+            body: NotificationCopy.unknownLocationBody(deviceCount: signalDevices.count),
             iconSymbol: "questionmark.circle",
             action: .openWizard,
             onAction: { [weak self] in

@@ -6,10 +6,14 @@ import AVPainReliever
 /// fingerprint after the user marks it as not-a-real-location.
 ///
 /// Keyed by the canonical fingerprint string of the attached USB set
-/// (see `LocationFingerprint.canonical`). `devices` is display-only —
-/// it carries the names captured at dismiss time so the Settings →
-/// Profiles "Ignored locations" list can render "iPhone" instead of
-/// raw vid:pid hex.
+/// (see `LocationFingerprint.canonical`), filtered to location-signal
+/// devices — transient plug-ins (flash drives, phones) are excluded
+/// before keying, so "dock" and "dock + USB stick" dismiss as one
+/// location. Entries persisted before that filtering existed may
+/// carry full-set keys; `handleUnknownLocation` checks both.
+/// `devices` is display-only — it carries the names captured at
+/// dismiss time so the Settings → Profiles "Ignored locations" list
+/// can render "iPhone" instead of raw vid:pid hex.
 struct IgnoredLocation: Codable, Hashable, Identifiable {
     /// Canonical fingerprint string for the attached device set.
     /// Stable across launches: same devices in the same combination

@@ -35,6 +35,20 @@ struct IOKitUSBWatcherTests {
         }
     }
 
+    @Test("currentDevicesNamed returns well-formed USB class codes")
+    func namedDevicesHaveWellFormedClasses() {
+        // Same live-IOKit smoke philosophy as above: no non-empty
+        // assertion (undocked laptops legitimately return nothing),
+        // just proof that the child-interface walk doesn't crash and
+        // any classes it reports are valid single-byte codes.
+        let watcher = IOKitUSBWatcher()
+        for named in watcher.currentDevicesNamed() {
+            for usbClass in named.usbClasses {
+                #expect(usbClass >= 0 && usbClass <= 0xFF)
+            }
+        }
+    }
+
     @Test("start + stop is idempotent and does not leak the notification port")
     func startStopIdempotent() {
         let watcher = IOKitUSBWatcher()
