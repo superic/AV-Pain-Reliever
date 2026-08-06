@@ -57,6 +57,16 @@ universal format support. v0.1.x will keep getting patch releases
 in parallel for anyone who doesn't need any of this. **Money.**
 ```
 
+### Distinguish "restart the app" from "restart your Mac" in the virtual-camera status (2026-08-05)
+
+Fixes #110. The `.requiresRelaunch` escalation conflated two failure modes: a stale AVFoundation discovery cache (an app relaunch fixes it) and a previous extension version stuck in `[terminated waiting to uninstall on reboot]` after an in-place app upgrade (only a Mac reboot fixes it). In the second mode, Settings prescribed the app-restart button anyway, sending the user through an infinite green-dot → red-dot loop: activation succeeds, the host-visibility check fails ~9 s later, repeat.
+
+Now, after a visibility-check failure escalates to `.requiresRelaunch`, the activator submits an `OSSystemExtensionRequest.propertiesRequest` and upgrades to a new `.requiresReboot` state when any returned copy reports `isUninstalling`. That state renders "Mac restart required" with copy explaining the pending-removal swap, and drops the relaunch button (it can't help). Query fails or comes back clean → stays `.requiresRelaunch`, i.e. today's behavior is the fallback.
+
+Wiring subtlety worth remembering: the properties request shares the activator's `OSSystemExtensionRequestDelegate`, and its terminal `didFinishWithResult(.completed)` would have been indistinguishable from an activation completing — flipping the state back to `.on` and restarting the failing loop. The delegate callbacks guard on request identity (`request === pendingPropertiesRequest`), and the reference is cleared in the terminal callbacks rather than `foundProperties` because both fire for the same request.
+
+Observed live on macOS 26 after installing a dev build over v0.2.0.19: the release-build extension sat in the uninstall queue, CMIO never published the dev copy to the host, and every relaunch looped. `systemextensionsctl list` is the diagnostic; a reboot is the cure.
+
 ### Transient USB devices no longer trigger the new-location prompt (2026-08-05)
 
 Plugging in a lone flash drive (or card reader, or a phone on a charge cable) used to fire the full "New location detected" flow — toast, menu badge, the works — because the unknown-location signal counted *any* USB device as evidence of being somewhere new. Now `handleUnknownLocation` classifies each attached device by its USB class data and subtracts the transient ones before deciding; if nothing location-worthy remains, it stays quiet.

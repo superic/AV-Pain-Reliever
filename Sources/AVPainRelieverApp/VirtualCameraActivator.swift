@@ -51,6 +51,16 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         /// in-session deactivation; resolved by relaunching the
         /// app from a fresh process.
         case requiresRelaunch
+        /// A stale copy of the extension (usually the pre-upgrade
+        /// version after an in-place app update) is queued for
+        /// uninstall-on-reboot, and CMIO won't publish the new one
+        /// until the queue flushes. An app relaunch can never fix
+        /// this — activation succeeds, the visibility check fails,
+        /// repeat — so Settings tells the user to restart the Mac
+        /// instead of offering the relaunch button. Detected by a
+        /// properties request finding an `isUninstalling` copy after
+        /// a visibility-check failure (see issue #110).
+        case requiresReboot
     }
 
     static let extensionBundleID = "com.ericwillis.avpainreliever.CameraExtension"
@@ -168,8 +178,8 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         case .activating, .needsApproval, .on:
             logger.notice("enable() called while already \(String(describing: self.state), privacy: .public) — no-op")
             return
-        case .requiresRelaunch:
-            logger.notice("enable() called while .requiresRelaunch — keeping that state until relaunch")
+        case .requiresRelaunch, .requiresReboot:
+            logger.notice("enable() called while \(String(describing: self.state), privacy: .public) — keeping that state until the host/Mac restarts")
             return
         case .off, .failed:
             break
@@ -358,6 +368,13 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
                 self.pendingSourceName = nil
                 self.stopCapturePipeline()
                 self.state = .requiresRelaunch
+                // Relaunch might not be enough: if a stale extension
+                // copy is queued for uninstall-on-reboot, only a Mac
+                // restart helps. Ask the OS and upgrade the state to
+                // `.requiresReboot` if so — starting from
+                // `.requiresRelaunch` keeps today's behavior as the
+                // fallback when the query fails or comes back clean.
+                self.refineRelaunchEscalation()
                 return
             }
             logger.debug("Visibility check: not yet visible, retrying in 1s")
@@ -496,6 +513,50 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         timer.resume()
     }
 
+    // MARK: - Relaunch-vs-reboot refinement
+
+    /// In-flight properties query submitted after a visibility-check
+    /// failure. Held so the shared `OSSystemExtensionRequestDelegate`
+    /// callbacks can tell it apart from activation / deactivation
+    /// requests — without the identity guard, the query's `.completed`
+    /// result would flip `.requiresRelaunch` back to `.on` and restart
+    /// the failing visibility loop. Cleared in the terminal delegate
+    /// callbacks (didFinish / didFail), not in `foundProperties`,
+    /// because both fire for the same request in that order.
+    private var pendingPropertiesRequest: OSSystemExtensionRequest?
+
+    private func refineRelaunchEscalation() {
+        let request = OSSystemExtensionRequest.propertiesRequest(
+            forExtensionWithIdentifier: Self.extensionBundleID,
+            queue: .main
+        )
+        request.delegate = self
+        pendingPropertiesRequest = request
+        OSSystemExtensionManager.shared.submitRequest(request)
+    }
+
+    func request(
+        _ request: OSSystemExtensionRequest,
+        foundProperties properties: [OSSystemExtensionProperties]
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, request === self.pendingPropertiesRequest else { return }
+            let stale = properties.filter(\.isUninstalling)
+            guard !stale.isEmpty else {
+                logger.notice("Properties query: no copy queued for uninstall — an app relaunch should recover")
+                return
+            }
+            // Only upgrade the escalation the visibility check set.
+            // If the user already toggled off (state .off) or some
+            // other transition happened while the query was in
+            // flight, don't stomp it.
+            guard self.state == .requiresRelaunch else { return }
+            let versions = stale.map(\.bundleShortVersion).joined(separator: ", ")
+            logger.error("Properties query: stale copy queued for uninstall-on-reboot (\(versions, privacy: .public)) — escalating to .requiresReboot")
+            self.state = .requiresReboot
+        }
+    }
+
     // MARK: - OSSystemExtensionRequestDelegate
 
     func request(
@@ -527,6 +588,12 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         logger.notice("Camera Extension request finished: result=\(result.rawValue, privacy: .public)")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            // Terminal callback for the relaunch-vs-reboot properties
+            // query — `foundProperties` already did the state work.
+            if request === self.pendingPropertiesRequest {
+                self.pendingPropertiesRequest = nil
+                return
+            }
             switch result {
             case .completed:
                 // Activation OR deactivation completed. Distinguish
@@ -553,6 +620,18 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         _ request: OSSystemExtensionRequest,
         didFailWithError error: Error
     ) {
+        // Failed relaunch-vs-reboot properties query: keep the
+        // `.requiresRelaunch` state the visibility check already set
+        // — wrong-but-recoverable advice beats surfacing a query
+        // error over a working escalation path.
+        if request === pendingPropertiesRequest {
+            logger.error("Properties query failed: \(error.localizedDescription, privacy: .public) — keeping .requiresRelaunch")
+            DispatchQueue.main.async { [weak self] in
+                self?.pendingPropertiesRequest = nil
+            }
+            return
+        }
+
         // Auth-cancel during deactivate: the prompt was declined, so
         // the extension is still alive on the OS side and only the
         // host's view of state is wrong (disable() flipped to .off
