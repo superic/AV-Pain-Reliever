@@ -737,5 +737,21 @@
                        type="application/octet-stream"
                        sparkle:edSignature="qkdfuKj9aJslCEnJO8v4O3Q4B9UbHHWgKwuBnEHEFHU6yPqcUpr9koULki2VKOx1wz8dqx28LF6v4wJfJlVODA==" length="3281656" />
         </item>
+        <item>
+            <title>Version 0.2.0.20</title>
+            <description><![CDATA[
+<h2>What's new</h2>
+<p>Two quality-of-life fixes, both from the "stop bugging me" department.</p>
+<p><strong>Your flash drive is not a location.</strong> Plug in a USB stick, a card reader, your phone on a charge cable — the app used to see that and go "new location! let's set it up!" like an over-eager concierge. Done with that. It now checks what a device actually <em>is</em> before counting it as evidence you've moved desks. Drives and phones get politely ignored; docks, hubs, webcams, keyboards still count, because those are the things desks are made of. And when it genuinely can't tell what something is, it errs on the side of asking — missing your real new dock would be worse than one extra prompt. That's the deal.</p>
+<p><strong>Straight talk about restarts.</strong> When the virtual camera got wedged after an update, Settings used to tell you to restart the app — and sometimes that advice was flat-out wrong, because macOS was holding the old camera extension hostage until reboot, and no number of app restarts was going to spring it. Now the app asks macOS which situation you're actually in and tells you the truth: "Restart required" when relaunching the app fixes it, "Mac restart required" when only a reboot will do. No more clicking a button that can't possibly work. Money.</p>
+]]></description>
+            <pubDate>Thu, 06 Aug 2026 04:34:39 +0000</pubDate>
+            <sparkle:version>0.2.0.20</sparkle:version>
+            <sparkle:shortVersionString>0.2.0.20</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/superic/av-pain-reliever/releases/download/v0.2.0.20/AVPainReliever.app.zip"
+                       type="application/octet-stream"
+                       sparkle:edSignature="L79OPMZtJTU4p20hLzfyEUawCNi6Kpzz85PvVi4gXHrYIsEPSXMattCy1foOClaF4rDLnMWUZKdzgEfcgnqbDw==" length="3302545" />
+        </item>
     </channel>
 </rss>
