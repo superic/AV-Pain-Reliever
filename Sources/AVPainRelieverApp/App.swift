@@ -209,10 +209,11 @@ private struct MenuContentView: View {
             } label: {
                 Label("Set Up Location…", systemImage: "plus.circle.fill")
             }
-            // Escape hatch: this device combination isn't a real
-            // place (phone on the couch, random USB stick). Records
-            // the fingerprint so subsequent plug-ins don't re-prompt;
-            // un-ignore lives in Settings → Profiles.
+            // Escape hatch: this device combination isn't a place
+            // the user wants profiles for (a friend's desk, a
+            // hotel dock). Records the fingerprint so subsequent
+            // plug-ins don't re-prompt; un-ignore lives in
+            // Settings → Profiles.
             Button {
                 delegate.ignoreCurrentUnknownLocation()
             } label: {
