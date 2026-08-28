@@ -54,12 +54,17 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         /// A stale copy of the extension (usually the pre-upgrade
         /// version after an in-place app update) is queued for
         /// uninstall-on-reboot, and CMIO won't publish the new one
-        /// until the queue flushes. An app relaunch can never fix
-        /// this — activation succeeds, the visibility check fails,
-        /// repeat — so Settings tells the user to restart the Mac
-        /// instead of offering the relaunch button. Detected by a
-        /// properties request finding an `isUninstalling` copy after
-        /// a visibility-check failure (see issue #110).
+        /// until the queue flushes. A bare app relaunch can't fix
+        /// this (activation succeeds, the visibility check fails,
+        /// repeat), so the relaunch button isn't offered. A toggle
+        /// off/on cycle can, though: the fresh deactivate + activate
+        /// re-registers the new copy, and recovery completes through
+        /// the normal `.requiresRelaunch` app restart (verified in
+        /// the field 2026-08-28). Settings copy leads with the
+        /// toggle cycle and keeps the Mac restart as the fallback.
+        /// Detected by a properties request finding an
+        /// `isUninstalling` copy after a visibility-check failure
+        /// (see issue #110).
         case requiresReboot
     }
 
