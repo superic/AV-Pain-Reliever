@@ -151,7 +151,19 @@ public final class CameraCaptureSession: NSObject {
         logger.info("Initial capture device: \(device.localizedName) (\(device.uniqueID))")
 
         session.beginConfiguration()
-        session.sessionPreset = .hd1280x720
+        // No sessionPreset: never force a specific format onto the
+        // device (the default .high picks from the device's own
+        // supported formats). Same lesson as the videoSettings
+        // comment below, one layer up: .hd1280x720 asks the DEVICE
+        // to run a 720p format, and a capture card only offers the
+        // format of its live HDMI signal (HDMI to U3 capture
+        // delivers 1080p60 only). With the preset forced, a solo
+        // open stalls at zero frames with no error; frames only
+        // flowed while another app had negotiated the device's
+        // native format. `CMIOSinkWriter` normalizes every frame to
+        // the source stream's 1280×720 BGRA via
+        // `VTPixelTransferSession`, so the capture format is free
+        // to be whatever the device actually does.
 
         guard installInput(device: device) else {
             session.commitConfiguration()
