@@ -262,12 +262,58 @@ public final class CameraCaptureSession: NSObject {
                 return false
             }
             session.addInput(input)
+            lockExplicitFormat(on: device)
             currentInput = input
             currentDeviceUniqueID = device.uniqueID
             return true
         } catch {
             logger.error("AVCaptureDeviceInput failed for \(device.localizedName): \(error.localizedDescription)")
             return false
+        }
+    }
+
+    /// Explicitly pin `activeFormat` + frame duration on the device.
+    /// USB capture cards (HDMI to U3 capture, 0x1e4e/0x701f) don't
+    /// start their stream for a session that leaves format selection
+    /// to AVFoundation's default pick: `startRunning()` reports
+    /// running, no error fires, and `captureOutput` never delivers.
+    /// The device only wakes for a client that locks a concrete
+    /// format — observed live: our solo session got zero frames for
+    /// minutes, then received its first frame 344 ms after Zoom
+    /// (which pins formats) opened the same device. Picks the
+    /// highest-resolution format (ties broken by max frame rate),
+    /// which for a capture card is the mode of its live input
+    /// signal. Runs after `addInput` so the lock survives the
+    /// session's own configuration pass.
+    private func lockExplicitFormat(on device: AVCaptureDevice) {
+        let best = device.formats.max { a, b in
+            let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
+            let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
+            let pa = Int(da.width) * Int(da.height)
+            let pb = Int(db.width) * Int(db.height)
+            if pa != pb { return pa < pb }
+            let fa = a.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+            let fb = b.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+            return fa < fb
+        }
+        guard let format = best else {
+            logger.error("lockExplicitFormat: \(device.localizedName) reports no formats")
+            return
+        }
+        do {
+            try device.lockForConfiguration()
+            device.activeFormat = format
+            if let range = format.videoSupportedFrameRateRanges
+                .max(by: { $0.maxFrameRate < $1.maxFrameRate })
+            {
+                device.activeVideoMinFrameDuration = range.minFrameDuration
+                device.activeVideoMaxFrameDuration = range.minFrameDuration
+            }
+            device.unlockForConfiguration()
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            logger.info("Locked format on \(device.localizedName): \(dims.width)x\(dims.height) \(FourCC.pretty(CMFormatDescriptionGetMediaSubType(format.formatDescription)))")
+        } catch {
+            logger.error("lockForConfiguration failed for \(device.localizedName): \(error.localizedDescription)")
         }
     }
 
