@@ -753,5 +753,21 @@
                        type="application/octet-stream"
                        sparkle:edSignature="L79OPMZtJTU4p20hLzfyEUawCNi6Kpzz85PvVi4gXHrYIsEPSXMattCy1foOClaF4rDLnMWUZKdzgEfcgnqbDw==" length="3302545" />
         </item>
+        <item>
+            <title>Version 0.2.0.21</title>
+            <description><![CDATA[
+<h2>What's new</h2>
+<p>You know what's worse than no camera? A camera that says everything's fine and shows you a black rectangle. v0.2.0.21 fixes that. If your profile points the virtual camera at an HDMI capture card, the old build would open the card, report success, and then deliver exactly zero frames — because capture cards don't stream for anybody who won't name a format. So now we name it. Resolution, frame rate, in writing. The card wakes up, your video shows up, everyone's happy.</p>
+<p>While we were in there, the recovery flow got a tune-up. When a leftover extension copy from an update blocks the camera, Settings used to jump straight to "restart your Mac." Turns out a ten-second toggle off-and-on usually does it — so that's the new first suggestion, and the full restart is the fallback, not the opener. The extension detector also learned some patience: macOS occasionally takes its sweet time spawning the camera extension, and we used to call it dead after 8 seconds. Now we give it a real chance, and we keep checking after that, quietly, just in case it shows up fashionably late.</p>
+<p>One more, for the battery watchers: the camera engine now naps when nobody's watching and nothing's flowing. Fewer wakeups, less CPU, cooler laps. You won't see it — that's the point. Money.</p>
+]]></description>
+            <pubDate>Sun, 30 Aug 2026 22:50:18 +0000</pubDate>
+            <sparkle:version>0.2.0.21</sparkle:version>
+            <sparkle:shortVersionString>0.2.0.21</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/superic/av-pain-reliever/releases/download/v0.2.0.21/AVPainReliever.app.zip"
+                       type="application/octet-stream"
+                       sparkle:edSignature="4sXCPf/LBOEzXIeinbxHL6+5xQCk9aV3RSIcrn8RPUBvMIoqAugKoI34jtl4JBW7XNy63EtI7NqPcuGXzvCDCw==" length="3314786" />
+        </item>
     </channel>
 </rss>
