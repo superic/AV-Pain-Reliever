@@ -37,4 +37,16 @@ public enum CameraDiscovery {
             position: .unspecified
         )
     }
+
+    /// The embedded virtual camera as AVFoundation sees it, or nil
+    /// when CMIO hasn't published the extension's device to this
+    /// process. Both callers that need to recognize it — the
+    /// activator's host-visibility check and the Settings live
+    /// preview, which opens it as a consumer — go through here so the
+    /// UID match exists once.
+    public static func virtualCameraDevice() -> AVCaptureDevice? {
+        session().devices.first {
+            $0.uniqueID == VirtualCameraIdentity.deviceUID
+        }
+    }
 }

@@ -47,8 +47,13 @@ enum VirtualCameraPreviewStatus: Equatable {
     }
 
     /// One-line status sentence. `sourceName` is the camera the host
-    /// pipeline has open as the virtual camera's source; it's only
-    /// worth naming while frames are actually flowing.
+    /// pipeline actually has open (`VirtualCameraActivator
+    /// .routedSourceName`), nil when nothing is on air.
+    ///
+    /// Frames arriving with no open source is its own answer, not a
+    /// nameless relay: the extension re-emits its cached frame at full
+    /// rate when the sink dries up, so that combination means the
+    /// picture on screen is a held frame, not live video.
     func label(sourceName: String?) -> String {
         switch self {
         case .idle:
@@ -62,8 +67,26 @@ enum VirtualCameraPreviewStatus: Equatable {
         case .stalled:
             return "Frames stopped arriving."
         case .streaming(let fps):
-            guard let sourceName else { return "Relaying \(fps) fps." }
+            guard let sourceName else {
+                return "Holding the last frame — no source camera is open."
+            }
             return "Relaying \(fps) fps from \(sourceName)."
+        }
+    }
+
+    /// Dot colour, paired with `label(sourceName:)` so the two can't
+    /// disagree about how good the news is. Green is reserved for
+    /// "live frames from a named, open source".
+    func dotTint(sourceName: String?) -> Color {
+        switch self {
+        case .idle:
+            return .secondary
+        case .deviceMissing, .accessDenied:
+            return Theme.Color.error
+        case .waitingForFrames, .stalled:
+            return Theme.Color.warn
+        case .streaming:
+            return sourceName == nil ? Theme.Color.warn : Theme.Color.success
         }
     }
 }
@@ -95,7 +118,11 @@ struct VirtualCameraPreviewCard: View {
         VStack(alignment: .leading, spacing: 8) {
             surface
             HStack(spacing: 8) {
-                StatusDot(tint: statusTint)
+                StatusDot(
+                    tint: controller.status.dotTint(
+                        sourceName: activator.routedSourceName
+                    )
+                )
                 Text(controller.status.label(sourceName: activator.routedSourceName))
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
@@ -127,15 +154,6 @@ struct VirtualCameraPreviewCard: View {
                 .strokeBorder(.separator)
         )
         .frame(maxWidth: .infinity, alignment: .center)
-    }
-
-    private var statusTint: Color {
-        switch controller.status {
-        case .streaming: return Theme.Color.success
-        case .waitingForFrames, .stalled: return Theme.Color.warn
-        case .deviceMissing, .accessDenied: return Theme.Color.error
-        case .idle: return .secondary
-        }
     }
 }
 
@@ -176,6 +194,11 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
     /// started afterwards would hold the real camera open with nothing
     /// on screen.
     private var wantsRunning = false
+    /// True between asking for camera access and the prompt's answer.
+    /// Without it, a second `setRunning(true)` while the dialog is up
+    /// (tab away and back) registers a second `requestAccess`
+    /// callback, and the grant would then run `beginSession` twice.
+    private var accessPromptPending = false
     /// Latches once the session has delivered at least one frame, so
     /// an empty sampling window can tell "never started" from
     /// "stopped". Reset by `stop()`; main-thread only.
@@ -203,27 +226,32 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
         case .authorized:
             beginSession()
         case .notDetermined:
+            guard !accessPromptPending else { return }
+            accessPromptPending = true
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 DispatchQueue.main.async {
-                    guard let self, self.wantsRunning else { return }
+                    guard let self else { return }
+                    self.accessPromptPending = false
+                    guard self.wantsRunning else { return }
                     if granted {
                         self.beginSession()
                     } else {
-                        self.status = .accessDenied
+                        self.setStatus(.accessDenied)
                     }
                 }
             }
         case .denied, .restricted:
-            status = .accessDenied
+            setStatus(.accessDenied)
         @unknown default:
-            status = .accessDenied
+            setStatus(.accessDenied)
         }
     }
 
     private func beginSession() {
+        guard !isRunning else { return }
         isRunning = true
         everDelivered = false
-        status = .waitingForFrames
+        setStatus(.waitingForFrames)
         configureIfPossible()
         startSampling()
     }
@@ -235,13 +263,13 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
     /// looking rather than latching a false "not found".
     private func configureIfPossible() {
         guard input == nil else { return }
-        guard let device = Self.virtualCameraDevice() else {
-            status = .deviceMissing
+        guard let device = CameraDiscovery.virtualCameraDevice() else {
+            setStatus(.deviceMissing)
             return
         }
         guard let deviceInput = try? AVCaptureDeviceInput(device: device) else {
             logger.error("Preview: AVCaptureDeviceInput failed for the virtual camera")
-            status = .deviceMissing
+            setStatus(.deviceMissing)
             return
         }
 
@@ -250,7 +278,7 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
         videoOutput.setSampleBufferDelegate(self, queue: sampleQueue)
         input = deviceInput
         output = videoOutput
-        status = .waitingForFrames
+        setStatus(.waitingForFrames)
 
         // Every mutation of the session runs on `sampleQueue`, so
         // configuration and start/stop can't interleave when the user
@@ -258,29 +286,62 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
         // as the device takes to spin up, which has no business
         // happening on the main thread.
         let session = self.session
-        sampleQueue.async {
+        sampleQueue.async { [weak self] in
             session.beginConfiguration()
+            // `canAdd…` before every add: the device was looked up on
+            // the main thread a moment ago and can be gone by now (the
+            // user toggling the virtual camera off on this very tab, an
+            // extension crash or Sparkle replace), and a rejected add
+            // raises an ObjC exception Swift can't catch — it takes the
+            // app down.
+            //
             // No sessionPreset, for the reason spelled out in
             // `CameraCaptureSession.installAndStart`: never force a
             // format onto the device. The extension's source stream
             // advertises exactly one (1280×720 BGRA), so the default
             // pick is the only pick.
-            session.addInput(deviceInput)
-            session.addOutput(videoOutput)
+            let canAdd = session.canAddInput(deviceInput)
+                && session.canAddOutput(videoOutput)
+            if canAdd {
+                session.addInput(deviceInput)
+                session.addOutput(videoOutput)
+            }
             session.commitConfiguration()
+            guard canAdd else {
+                videoOutput.setSampleBufferDelegate(nil, queue: nil)
+                logger.error("Preview: session refused the virtual camera's input/output — treating the device as gone")
+                DispatchQueue.main.async {
+                    self?.handleConfigurationRefused()
+                }
+                return
+            }
             session.startRunning()
         }
         logger.notice("Preview: opened the virtual camera as a consumer")
     }
 
+    /// The session wouldn't take the device. Drop back to the
+    /// device-missing state with nothing installed, so the next
+    /// sampling tick retries the lookup from scratch.
+    private func handleConfigurationRefused() {
+        guard isRunning else { return }
+        input = nil
+        output = nil
+        setStatus(.deviceMissing)
+    }
+
     private func stop() {
+        // Ahead of the `isRunning` guard: a session that never started
+        // can still have left a status behind (`.accessDenied` from a
+        // denied prompt), and switching the preview off has to clear
+        // it — otherwise the red access error outlives the virtual
+        // camera being deliberately turned off.
+        setStatus(.idle)
         guard isRunning else { return }
         isRunning = false
         sampleTimer?.cancel()
         sampleTimer = nil
-        status = .idle
         everDelivered = false
-        resetFrameCount()
 
         // Input and output are installed together or not at all;
         // nothing to release if `configureIfPossible` never found the
@@ -289,13 +350,24 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
         self.input = nil
         self.output = nil
         let session = self.session
-        sampleQueue.async {
+        sampleQueue.async { [weak self] in
             // Detaching the delegate from the delegate's own queue
-            // guarantees no callback is in flight past this point.
+            // guarantees no callback is in flight past this point, so
+            // the counter reset that follows can't be outrun by a
+            // frame leaking into the next run's first tick.
             output.setSampleBufferDelegate(nil, queue: nil)
+            self?.resetFrameCount()
             session.beginConfiguration()
-            session.removeInput(input)
-            session.removeOutput(output)
+            // Remove only what the configuration pass actually
+            // installed: a refused add (see `configureIfPossible`)
+            // leaves these detached, and removing a stranger raises an
+            // uncatchable ObjC exception.
+            if session.inputs.contains(where: { $0 === input }) {
+                session.removeInput(input)
+            }
+            if session.outputs.contains(where: { $0 === output }) {
+                session.removeOutput(output)
+            }
             session.commitConfiguration()
             session.stopRunning()
         }
@@ -328,14 +400,27 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
         lastSampleAt = now
         let frames = takeFrameCount()
 
+        // No installed device → `configureIfPossible` owns the status
+        // (`.deviceMissing`), and any frames counted are leftovers from
+        // the run that just ended rather than evidence of a live feed.
+        guard input != nil else { return }
+
         if frames > 0 {
             everDelivered = true
-            status = .streaming(fps: max(1, Int((Double(frames) / elapsed).rounded())))
-        } else if input != nil {
-            status = everDelivered ? .stalled : .waitingForFrames
+            setStatus(.streaming(fps: max(1, Int((Double(frames) / elapsed).rounded()))))
+        } else {
+            setStatus(everDelivered ? .stalled : .waitingForFrames)
         }
-        // Input still nil → `configureIfPossible` owns the status
-        // (`.deviceMissing`) and there's nothing to measure.
+    }
+
+    /// Equality-guarded so an unchanged status doesn't fire
+    /// `objectWillChange` once a second for the life of the tab. The
+    /// source-name half of the row has its own publisher
+    /// (`VirtualCameraActivator.routedSourceName`) and doesn't rely on
+    /// this churn to stay fresh.
+    private func setStatus(_ newStatus: VirtualCameraPreviewStatus) {
+        guard status != newStatus else { return }
+        status = newStatus
     }
 
     private func takeFrameCount() -> Int {
@@ -352,12 +437,19 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
         frameCountLock.unlock()
     }
 
-    /// The published virtual camera, matched on the UID the extension
-    /// registers — the same identity the capture side uses to refuse
-    /// the virtual camera as a *source*.
-    private static func virtualCameraDevice() -> AVCaptureDevice? {
-        CameraDiscovery.session().devices.first {
-            $0.uniqueID == VirtualCameraIdentity.deviceUID
+    /// Last-resort teardown. `onDisappear` and the tab-selection flag
+    /// are the intended paths, but SwiftUI can drop a scene's view
+    /// tree without calling either, and a session left running holds
+    /// the real camera open behind a window that no longer exists.
+    /// Only touches the capture objects — no `@Published` writes, the
+    /// observers are already gone.
+    deinit {
+        sampleTimer?.cancel()
+        let session = self.session
+        let output = self.output
+        sampleQueue.async {
+            output?.setSampleBufferDelegate(nil, queue: nil)
+            session.stopRunning()
         }
     }
 }

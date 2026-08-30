@@ -12,10 +12,33 @@ struct VirtualCameraPreviewStatusTests {
         )
     }
 
-    @Test("streaming still reports fps with no source name")
+    @Test("frames with no open source read as a held frame, not a relay")
     func streamingWithoutSource() {
-        let status = VirtualCameraPreviewStatus.streaming(fps: 24)
-        #expect(status.label(sourceName: nil) == "Relaying 24 fps.")
+        // The extension re-emits its cached frame at full rate when
+        // the sink dries up, so "frames arriving" plus "no camera on
+        // air" is a frozen picture. Naming no source but claiming a
+        // relay would be the lie this replaced.
+        let status = VirtualCameraPreviewStatus.streaming(fps: 30)
+        let label = status.label(sourceName: nil)
+        #expect(!label.contains("Relaying"))
+        #expect(label == "Holding the last frame — no source camera is open.")
+    }
+
+    @Test("green is reserved for live frames from a named open source")
+    func onlyNamedSourceGoesGreen() {
+        let streaming = VirtualCameraPreviewStatus.streaming(fps: 30)
+        #expect(streaming.dotTint(sourceName: "Studio Display Camera") == Theme.Color.success)
+        #expect(streaming.dotTint(sourceName: nil) == Theme.Color.warn)
+    }
+
+    @Test("dot colors match the severity of their sentences")
+    func dotTintSeverity() {
+        #expect(VirtualCameraPreviewStatus.deviceMissing.dotTint(sourceName: nil) == Theme.Color.error)
+        #expect(VirtualCameraPreviewStatus.accessDenied.dotTint(sourceName: nil) == Theme.Color.error)
+        #expect(VirtualCameraPreviewStatus.waitingForFrames.dotTint(sourceName: nil) == Theme.Color.warn)
+        #expect(VirtualCameraPreviewStatus.stalled.dotTint(sourceName: nil) == Theme.Color.warn)
+        // A named source can't upgrade a non-streaming state.
+        #expect(VirtualCameraPreviewStatus.stalled.dotTint(sourceName: "Some Camera") == Theme.Color.warn)
     }
 
     @Test("the three diagnostic states read differently from each other")

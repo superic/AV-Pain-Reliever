@@ -81,6 +81,13 @@ struct SettingsView: View {
         // mutates `settingsTab = .profiles` right before opening,
         // and `.onDisappear` only fires when the previous session
         // closed — so the override survives the next open.
+        //
+        // Load-bearing beyond tab bookkeeping: the Camera tab's live
+        // preview runs while `settingsTab == .camera`, so this reset is
+        // one of the paths that shuts the capture session (and the real
+        // camera) down when the window closes. The others are the
+        // card's own `onDisappear` and the controller's `deinit`. Don't
+        // drop it without checking `VirtualCameraPreviewCard`.
         .onDisappear {
             delegate.settingsTab = .general
         }
