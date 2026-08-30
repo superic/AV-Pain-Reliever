@@ -57,6 +57,14 @@ universal format support. v0.1.x will keep getting patch releases
 in parallel for anyone who doesn't need any of this. **Money.**
 ```
 
+### Capture-card virtual camera showed black video (2026-08-30)
+
+Fixes #113. With a profile routing the virtual camera to a USB capture card, Zoom showed a black feed even though the badge was green and the pipeline reported healthy — `session.isRunning=true`, sink writer connected, no runtime error, and zero frames ever delivered.
+
+Two layers of root cause, both diagnosed live on 2026-08-28. First, `CameraCaptureSession` forced `session.sessionPreset = .hd1280x720` onto the capture device; the card only offers the format of its live HDMI signal, so the unsatisfiable preset stalled it silently. Second, dropping the preset wasn't sufficient on its own: the card also ignores AVFoundation's default format pick and only starts streaming for a client that pins a concrete `activeFormat` + frame duration. The smoking gun was a solo session sitting frameless for minutes, then receiving its first frame 344 ms after Zoom (which pins formats) opened the same device, and continuing to receive frames after Zoom released it.
+
+Fix: drop the forced preset, and pin `activeFormat` (highest resolution, ties broken by max frame rate) plus frame duration on the device at input-install time. `CMIOSinkWriter` already normalizes every frame to 1280×720 BGRA regardless of the source stream's native format, so downstream consumers see no change.
+
 ### Stale-extension recovery copy now leads with the toggle cycle, not a Mac reboot (2026-08-28)
 
 Field evidence overturned the 2026-08-05 assumption that "only a Mac reboot fixes" the `[terminated waiting to uninstall on reboot]` state. Hit the exact `.requiresReboot` condition again (dev build replacing the installed extension, `isUninstalling` copy detected, camera absent from `system_profiler SPCameraDataType`), and a Settings toggle off → on cycle followed by the `.requiresRelaunch` app restart brought the camera back with no reboot. Mechanism: the fresh deactivate + activate re-registers the new copy with sysextd, and the app restart gives the host a clean CMIO context, the same path that works on every cold launch. `docs/virtual-camera.md` had already recorded "reboot or a Settings toggle off/on cycle" from M3/M4 dev iteration; the #111 copy just never offered the second option.
