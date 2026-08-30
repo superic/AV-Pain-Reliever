@@ -46,6 +46,11 @@ enum Theme {
         /// Warning thumbnail for operational notifications (config
         /// corruption, unrecoverable load failures).
         static let warning = "exclamationmark.triangle"
+
+        /// Thumbnail for the automatic camera-recovery restart notice.
+        /// Reads as "camera, being cycled" rather than "camera broken"
+        /// — the app is already fixing it by the time this shows up.
+        static let cameraRecovery = "arrow.triangle.2.circlepath.camera"
     }
 
     enum Copy {

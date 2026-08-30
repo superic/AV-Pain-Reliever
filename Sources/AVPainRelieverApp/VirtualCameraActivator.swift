@@ -50,6 +50,13 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         /// can't be queried successfully. Detected by tracking the
         /// in-session deactivation; resolved by relaunching the
         /// app from a fresh process.
+        ///
+        /// Also the terminus of a visibility-check timeout, where the
+        /// same fresh-process cure applies for a different reason (a
+        /// stale CMIO context after an in-place extension replace).
+        /// That path relaunches itself once — see
+        /// `relaunchForStaleDiscovery` — and only sits here waiting on
+        /// the user if the automatic attempt already failed.
         case requiresRelaunch
         /// A stale copy of the extension (usually the pre-upgrade
         /// version after an in-place app update) is queued for
@@ -118,6 +125,13 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     private static let visibilityRecheckIntervalSeconds: TimeInterval = 5
     private static let visibilityRecheckBudgetSeconds: TimeInterval = 120
 
+    /// Head start the user-visible notice gets before the automatic
+    /// stale-discovery relaunch quits the process.
+    /// `UNUserNotificationCenter.add` is asynchronous, and a notice
+    /// that never reaches notificationd would leave the app vanishing
+    /// and reappearing with no explanation.
+    private static let relaunchNoticeLeadSeconds: TimeInterval = 1.5
+
     @Published private(set) var state: State = .off {
         didSet {
             // Skip logging the no-change case. Many call sites
@@ -132,6 +146,13 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// camera. Set once during host setup; the rationale lives at
     /// the consumer's wiring site.
     var onVisibilityConfirmed: (() -> Void)?
+
+    /// Fires on the main thread immediately before the automatic
+    /// stale-discovery relaunch quits the host (issue #120). The host
+    /// wires this to a notification so the app disappearing and coming
+    /// back is explained rather than mysterious. Set once during host
+    /// setup.
+    var onStaleDiscoveryRelaunch: (() -> Void)?
 
     /// Fires on the main thread when the user cancels the macOS auth
     /// prompt that gates a deactivate request. The OS-level deactivate
@@ -191,6 +212,11 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// not self-heal. Cancelled on disable(), on a fresh activation,
     /// and by the timer itself once the state moves on.
     private var visibilityRecheckTimer: DispatchSourceTimer?
+
+    /// Cross-process latch that keeps the automatic stale-discovery
+    /// relaunch to one attempt per broken episode. See
+    /// `VirtualCameraRelaunchGuard`.
+    private let relaunchGuard = VirtualCameraRelaunchGuard()
 
     /// Returns true if launch should auto-enable: env-var debug
     /// override OR the user's persisted toggle is on. The env var
@@ -274,7 +300,8 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// from the persisted toggle and gets a clean CMIO context that
     /// finds the activated extension immediately. Wired to the
     /// "Restart" button on the Settings UI's `.requiresRelaunch`
-    /// state.
+    /// state, and to the automatic stale-discovery escalation in
+    /// `relaunchForStaleDiscovery`.
     func relaunch() {
         let bundleURL = Bundle.main.bundleURL
         logger.notice("Relaunching host: \(bundleURL.path, privacy: .public)")
@@ -393,11 +420,12 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
             guard let self, self.state == .on else { return }
             if Self.hostCanSeeVirtualCamera() {
                 logger.notice("Visibility check: host sees the virtual camera in DiscoverySession")
-                self.onVisibilityConfirmed?()
+                self.noteVisibilityConfirmed()
                 return
             }
             if Date() >= deadline {
                 logger.error("Visibility check: host process can't see its own Camera Extension within budget; escalating to .requiresRelaunch")
+                Self.logCMIOCrossCheck(phase: "poll")
                 self.endConsumerWatch()
                 self.stopGraceTimer?.cancel()
                 self.stopGraceTimer = nil
@@ -429,7 +457,9 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// would have taken — back to `.on`, consumer watch re-armed (the
     /// escalation tore it down), profile re-applied via
     /// `onVisibilityConfirmed` — so the stale restart advice
-    /// disappears on its own.
+    /// disappears on its own. If the budget expires instead, the host
+    /// process itself is the problem — hand off to
+    /// `relaunchForStaleDiscovery`.
     private func beginVisibilityRecheck() {
         let deadline = Date().addingTimeInterval(Self.visibilityRecheckBudgetSeconds)
         let timer = DispatchSource.makeTimerSource(queue: .main)
@@ -450,12 +480,17 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
                 self.endVisibilityRecheck()
                 self.state = .on
                 self.beginConsumerWatch()
-                self.onVisibilityConfirmed?()
+                self.noteVisibilityConfirmed()
                 return
             }
             if Date() >= deadline {
-                logger.notice("Visibility re-check: still invisible after \(Int(Self.visibilityRecheckBudgetSeconds), privacy: .public)s — the restart advice stands")
+                logger.notice("Visibility re-check: still invisible after \(Int(Self.visibilityRecheckBudgetSeconds), privacy: .public)s — in-process discovery is not going to refresh")
                 self.endVisibilityRecheck()
+                // Delete this one line to downgrade the escalation to
+                // offer-only: the state already routes Settings to its
+                // "Restart AV Pain Reliever" button, so the user keeps
+                // the manual path and nothing else changes.
+                self.relaunchForStaleDiscovery()
             }
         }
         visibilityRecheckTimer?.cancel()
@@ -467,6 +502,60 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     private func endVisibilityRecheck() {
         visibilityRecheckTimer?.cancel()
         visibilityRecheckTimer = nil
+    }
+
+    /// Visibility is proven in this process. Spend-once latch for the
+    /// automatic relaunch resets here so a future stale-context
+    /// episode gets its own attempt.
+    private func noteVisibilityConfirmed() {
+        relaunchGuard.clearRelaunchMarker()
+        onVisibilityConfirmed?()
+    }
+
+    /// The re-check budget expired with the camera still invisible to
+    /// this process. Issue #120: AVFoundation's device list is
+    /// effectively frozen per-process in this state — the host polled
+    /// for 30s and re-checked for 2 minutes while a freshly-launched
+    /// Zoom opened the very same device — so more querying can't help.
+    /// Only a fresh process gets a fresh CMIO context, which is
+    /// exactly what Settings tells the user to do by hand. Do it for
+    /// them, once, with a notice.
+    ///
+    /// Not offered in `.requiresReboot`: there a stale copy is queued
+    /// for uninstall-on-reboot and a bare relaunch provably loops
+    /// (#110/#112) — that state's recovery is the toggle cycle, and
+    /// the Settings copy already says so.
+    private func relaunchForStaleDiscovery() {
+        guard state == .requiresRelaunch else {
+            logger.notice("Stale-discovery relaunch declined: state is \(String(describing: self.state), privacy: .public) — its own recovery advice stands")
+            return
+        }
+        guard relaunchGuard.canRelaunch else {
+            logger.error("Stale-discovery relaunch declined: this process already came back from one and still can't see the camera — leaving the manual recovery advice in place")
+            return
+        }
+        Self.logCMIOCrossCheck(phase: "re-check")
+        relaunchGuard.markRelaunched()
+        logger.notice("Stale-discovery relaunch: quitting for a fresh CMIO context")
+        onStaleDiscoveryRelaunch?()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.relaunchNoticeLeadSeconds) { [weak self] in
+            self?.relaunch()
+        }
+    }
+
+    /// Log-only cross-check of the two device lists at an escalation
+    /// point. `CMIOObjectGetPropertyData(kCMIOHardwarePropertyDevices)`
+    /// re-reads the system list on every call; DiscoverySession answers
+    /// from a per-process cache. "CMIO yes, AVFoundation no" is the
+    /// stale-context signature from #120, and the pair of answers is
+    /// what a support log needs to tell that apart from an extension
+    /// that genuinely never published. Deliberately does NOT gate the
+    /// relaunch decision — CMIO's behavior in the stale state hasn't
+    /// been verified on hardware, and the relaunch is the right move
+    /// either way.
+    private static func logCMIOCrossCheck(phase: String) {
+        let cmioSees = CMIODeviceCatalog.deviceID(forUID: virtualCameraUID) != nil
+        logger.notice("CMIO cross-check (\(phase, privacy: .public)): CMIO sees the device=\(cmioSees, privacy: .public), AVFoundation DiscoverySession does not")
     }
 
     /// On disable, if the system-wide preferred camera still points

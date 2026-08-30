@@ -55,6 +55,18 @@ enum NotificationCopy {
     /// Save Logs for Support entry.
     static let configUnrecoverableBody = "Use Advanced > Save Logs for Support and send us the log."
 
+    /// Title for the automatic-restart notice (issue #120). Names the
+    /// app: the user is about to watch it quit and come back, and the
+    /// notification is an external surface where the brand is the
+    /// point (see `Theme.Copy.appName`).
+    static let cameraSelfRestartTitle = "Restarting AV Pain Reliever"
+
+    /// Body for the same notice. Says what broke in plain terms, that
+    /// the fix is already running, and that the camera selection in
+    /// other apps survives it — the user's next thought is "do I have
+    /// to re-pick anything in Zoom?"
+    static let cameraSelfRestartBody = "macOS hid the virtual camera from this app. Reopening to pick it back up — nothing to re-select in your video apps."
+
     /// Body text for the "new location detected" toast — warmer than
     /// the bare "N USB devices attached" version, while still telling
     /// the user the next concrete action they can take.

@@ -219,6 +219,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         virtualCameraActivator.onVisibilityConfirmed = { [weak self] in
             self?.engine?.reapply()
         }
+        // The activator is about to quit the app to shake off a stale
+        // CMIO context (issue #120). Tell the user first — an agent
+        // that vanishes and reappears on its own otherwise reads as a
+        // crash. Not gated by `notificationsEnabled`: that toggle
+        // covers the friendly per-switch toast, not operational
+        // notices (same rule as `notifyOfLoadOutcome`).
+        virtualCameraActivator.onStaleDiscoveryRelaunch = { [weak self] in
+            self?.notifier.notify(
+                title: NotificationCopy.cameraSelfRestartTitle,
+                body: NotificationCopy.cameraSelfRestartBody,
+                iconSymbol: Theme.Symbol.cameraRecovery
+            )
+        }
         // User cancelled the macOS auth prompt for a deactivate.
         // Activator already restored its state to `.on`; sync the
         // persisted setting so the Settings toggle bounces back, and
