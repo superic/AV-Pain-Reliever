@@ -190,7 +190,7 @@ private struct CameraSettingsTab: View {
         case .on: return "Active"
         case .failed(let msg): return "Failed: \(msg)"
         case .requiresRelaunch: return "Restart required"
-        case .requiresReboot: return "Mac restart required"
+        case .requiresReboot: return "Re-enable required"
         }
     }
 
@@ -219,7 +219,7 @@ private struct CameraSettingsTab: View {
         case .requiresRelaunch:
             return "macOS holds the virtual camera in a stale state after toggling off and back on inside one session. Restart the app to re-enable it cleanly."
         case .requiresReboot:
-            return "A previous version of the camera extension is still queued for removal, and macOS won't publish the new one until that finishes. Restart your Mac to complete the swap — restarting the app won't help."
+            return "A previous version of the camera extension is still queued for removal, which can keep the new one hidden. Toggle this off and back on to re-register it, then restart the app if prompted. If the camera still doesn't appear, restart your Mac."
         }
     }
 

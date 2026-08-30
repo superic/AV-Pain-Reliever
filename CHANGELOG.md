@@ -57,6 +57,12 @@ universal format support. v0.1.x will keep getting patch releases
 in parallel for anyone who doesn't need any of this. **Money.**
 ```
 
+### Stale-extension recovery copy now leads with the toggle cycle, not a Mac reboot (2026-08-28)
+
+Field evidence overturned the 2026-08-05 assumption that "only a Mac reboot fixes" the `[terminated waiting to uninstall on reboot]` state. Hit the exact `.requiresReboot` condition again (dev build replacing the installed extension, `isUninstalling` copy detected, camera absent from `system_profiler SPCameraDataType`), and a Settings toggle off → on cycle followed by the `.requiresRelaunch` app restart brought the camera back with no reboot. Mechanism: the fresh deactivate + activate re-registers the new copy with sysextd, and the app restart gives the host a clean CMIO context, the same path that works on every cold launch. `docs/virtual-camera.md` had already recorded "reboot or a Settings toggle off/on cycle" from M3/M4 dev iteration; the #111 copy just never offered the second option.
+
+`.requiresReboot` now renders "Re-enable required" and walks the user through toggle-off/on → restart-the-app-if-prompted, keeping the Mac restart as the explicit fallback if the camera still doesn't appear. No state-machine changes; the relaunch button still isn't offered in this state (a bare relaunch without the toggle cycle genuinely can't help).
+
 ### Distinguish "restart the app" from "restart your Mac" in the virtual-camera status (2026-08-05)
 
 Fixes #110. The `.requiresRelaunch` escalation conflated two failure modes: a stale AVFoundation discovery cache (an app relaunch fixes it) and a previous extension version stuck in `[terminated waiting to uninstall on reboot]` after an in-place app upgrade (only a Mac reboot fixes it). In the second mode, Settings prescribed the app-restart button anyway, sending the user through an infinite green-dot → red-dot loop: activation succeeds, the host-visibility check fails ~9 s later, repeat.
