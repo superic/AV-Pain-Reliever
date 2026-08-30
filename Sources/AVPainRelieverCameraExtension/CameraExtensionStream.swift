@@ -147,10 +147,12 @@ final class CameraExtensionStreamSource: NSObject, CMIOExtensionStreamSource {
         streamingCounter += 1
         logger.info("source startStream — streamingCounter=\(self.streamingCounter, privacy: .public)")
         // Edge-trigger only: a 0→1 transition is the moment the host
-        // needs to spin up its capture pipeline. Subsequent clients
-        // joining a stream that's already live don't need to wake
-        // anything up.
+        // needs to spin up its capture pipeline, and the moment our
+        // own consume pump has to leave its idle cadence. Subsequent
+        // clients joining a stream that's already live don't need to
+        // wake anything up.
         if wasIdle {
+            device?.sourceClientBecameActive()
             CFNotificationCenterPostNotification(
                 CFNotificationCenterGetDarwinNotifyCenter(),
                 CFNotificationName(Self.consumerActiveNotification as CFString),

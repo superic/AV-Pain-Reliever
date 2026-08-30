@@ -23,6 +23,14 @@ private let logger = Logger(
 /// passes IOSurfaces between host and extension processes
 /// transparently — no explicit XPC.
 ///
+/// That loop is a timer, and it runs for as long as the host holds
+/// the sink open — which some clients (Zoom) do for their entire
+/// process lifetime, call or no call. So the pump has two cadences:
+/// the full 90 Hz drain whenever anything is happening, and a slow
+/// idle tick once the source has no clients *and* the sink has been
+/// dry for a few seconds. It jumps back to full rate the instant a
+/// frame arrives or an AVCapture client attaches.
+///
 /// Identifier and name are stable so reinstalls don't churn the
 /// device registry — apps that remember "AV Pain Reliever" by
 /// uniqueID continue to find it after a v0.2.x → v0.2.y upgrade.
@@ -52,6 +60,11 @@ final class CameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSource {
         qos: .userInteractive
     )
     private var consumeTimer: DispatchSourceTimer?
+
+    /// Whether `consumeTimer` is currently on the idle schedule.
+    /// Mutated only on `consumeQueue`; read from the consume
+    /// completion as a cheap "do I need to hop?" hint.
+    private var pumpIsIdle = false
 
     init(localizedName: String) {
         super.init()
@@ -131,16 +144,47 @@ final class CameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSource {
         }
     }
 
+    /// Active cadence: 3× the frame rate so we never lag behind a
+    /// producer that happens to deliver slightly bursty frames.
+    private static let activeTickInterval = DispatchTimeInterval.nanoseconds(
+        Int(1_000_000_000.0 / (30.0 * 3.0))
+    )
+
+    /// Idle cadence: just often enough to notice the sink coming back
+    /// to life on its own, in the case where no client edge fires.
+    private static let idleTickInterval = DispatchTimeInterval.milliseconds(500)
+
+    /// Generous leeway on both schedules — the 3× oversampling exists
+    /// precisely so individual wakeups don't have to be punctual, and
+    /// slack lets the kernel coalesce our timer with everyone else's
+    /// instead of waking the core on its own. (The old `.strict` +
+    /// 1 ms schedule cost ~1.7% of a core around the clock whenever a
+    /// client held the sink open.)
+    private static let activeTickLeeway = DispatchTimeInterval.milliseconds(8)
+    private static let idleTickLeeway = DispatchTimeInterval.milliseconds(250)
+
+    /// How many back-to-back empty consumes before we downshift —
+    /// ~3 s at the active cadence.
+    private static let idleDownshiftAfterEmpties: UInt64 = 90 * 3
+
+    /// Whether the pump can drop to the idle cadence. Deliberately
+    /// conservative: a watching client keeps the full-rate schedule
+    /// no matter how dry the sink is, because the hold-last-frame
+    /// re-emits it depends on ride on these same ticks.
+    private static func shouldRunIdle(
+        sourceClients: UInt32,
+        consecutiveEmptyConsumes: UInt64
+    ) -> Bool {
+        sourceClients == 0
+            && consecutiveEmptyConsumes >= idleDownshiftAfterEmpties
+    }
+
     private func startConsumeTimer(client: CMIOExtensionClient) {
         consumeTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: consumeQueue)
-        // 3× the frame rate so we never lag behind a producer that
-        // happens to deliver slightly bursty frames. Empty queue
-        // ticks are cheap.
-        let interval = DispatchTimeInterval.nanoseconds(
-            Int(1_000_000_000.0 / (30.0 * 3.0))
-        )
-        timer.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(1))
+        let timer = DispatchSource.makeTimerSource(queue: consumeQueue)
+        pumpIsIdle = false
+        consecutiveEmptyConsumes = 0
+        schedule(timer, idle: false)
         timer.setEventHandler { [weak self] in
             self?.consumeOne(client: client)
         }
@@ -148,9 +192,40 @@ final class CameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSource {
         timer.resume()
     }
 
+    private func schedule(_ timer: DispatchSourceTimer, idle: Bool) {
+        timer.schedule(
+            deadline: .now(),
+            repeating: idle ? Self.idleTickInterval : Self.activeTickInterval,
+            leeway: idle ? Self.idleTickLeeway : Self.activeTickLeeway
+        )
+    }
+
+    /// Move the running pump between cadences. Must be called on
+    /// `consumeQueue` — it touches the timer and the empty-run
+    /// counter that the tick handler owns.
+    private func setPumpIdle(_ idle: Bool) {
+        guard pumpIsIdle != idle, let timer = consumeTimer else { return }
+        pumpIsIdle = idle
+        if !idle { consecutiveEmptyConsumes = 0 }
+        schedule(timer, idle: idle)
+        logger.info(
+            "consume pump → \(idle ? "idle" : "active", privacy: .public) cadence"
+        )
+    }
+
+    /// Called by `CameraExtensionStreamSource.startStream` on the 0→1
+    /// client edge. Someone is about to watch, so the pump needs to
+    /// be back at full rate before the first frame is expected.
+    func sourceClientBecameActive() {
+        consumeQueue.async { [weak self] in
+            self?.setPumpIdle(false)
+        }
+    }
+
     private var consumedCount: UInt64 = 0
     private var forwardedCount: UInt64 = 0
     private var emptyConsumeCount: UInt64 = 0
+    private var consecutiveEmptyConsumes: UInt64 = 0
     private var heldFrameCount: UInt64 = 0
 
     /// Most recent sample buffer received from the host. Re-emitted
@@ -189,15 +264,28 @@ final class CameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSource {
 
             guard let sampleBuffer else {
                 self.emptyConsumeCount += 1
+                self.consecutiveEmptyConsumes += 1
                 if self.emptyConsumeCount % 90 == 1 {
                     logger.debug(
                         "consume returned no buffer (\(self.emptyConsumeCount, privacy: .public) empty so far)"
                     )
                 }
                 self.maybeEmitHeldFrame(nowNs: nowNs)
+                if !self.pumpIsIdle,
+                   Self.shouldRunIdle(
+                       sourceClients: self.streamSource.streamingCounter,
+                       consecutiveEmptyConsumes: self.consecutiveEmptyConsumes
+                   )
+                {
+                    self.consumeQueue.async { self.setPumpIdle(true) }
+                }
                 return
             }
 
+            self.consecutiveEmptyConsumes = 0
+            if self.pumpIsIdle {
+                self.consumeQueue.async { self.setPumpIdle(false) }
+            }
             self.consumedCount += 1
             if self.consumedCount == 1 || self.consumedCount % 60 == 0 {
                 logger.info(
