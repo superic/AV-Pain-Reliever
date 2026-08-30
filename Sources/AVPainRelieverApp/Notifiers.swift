@@ -32,24 +32,48 @@ public protocol Notifier {
     /// user clicks the button. Backends that can't render action
     /// buttons (AppleScript fallback) drop both. Pass `nil` for both
     /// to post a plain toast.
+    ///
+    /// `completion` fires on the main thread once the backend has
+    /// handed the notification off to the system — accepted, rejected,
+    /// or dropped because the backend can't post at all. It is *not* a
+    /// promise the banner was displayed (a user who denied
+    /// authorization gets no banner and no error). Callers that are
+    /// about to quit the app use it so they don't race their own
+    /// termination; everyone else passes nil.
     func notify(
         title: String,
         body: String?,
         iconSymbol: String?,
         action: NotificationAction?,
-        onAction: (() -> Void)?
+        onAction: (() -> Void)?,
+        completion: (() -> Void)?
     )
 }
 
 extension Notifier {
     /// Convenience for action-less, icon-less notifications.
     public func notify(title: String, body: String?) {
-        notify(title: title, body: body, iconSymbol: nil, action: nil, onAction: nil)
+        notify(title: title, body: body, iconSymbol: nil, action: nil, onAction: nil, completion: nil)
     }
 
     /// Convenience for a notification with just an icon thumbnail.
     public func notify(title: String, body: String?, iconSymbol: String?) {
-        notify(title: title, body: body, iconSymbol: iconSymbol, action: nil, onAction: nil)
+        notify(title: title, body: body, iconSymbol: iconSymbol, action: nil, onAction: nil, completion: nil)
+    }
+
+    /// Convenience for the fire-and-forget action case — the spelling
+    /// every call site except the pre-quit notice uses.
+    public func notify(
+        title: String,
+        body: String?,
+        iconSymbol: String?,
+        action: NotificationAction?,
+        onAction: (() -> Void)?
+    ) {
+        notify(
+            title: title, body: body, iconSymbol: iconSymbol,
+            action: action, onAction: onAction, completion: nil
+        )
     }
 }
 
@@ -123,7 +147,8 @@ public final class UserNotificationsNotifier: NSObject, Notifier, UNUserNotifica
         body: String?,
         iconSymbol: String?,
         action: NotificationAction?,
-        onAction: (() -> Void)?
+        onAction: (() -> Void)?,
+        completion: (() -> Void)?
     ) {
         let content = UNMutableNotificationContent()
         content.title = title
@@ -172,6 +197,12 @@ public final class UserNotificationsNotifier: NSObject, Notifier, UNUserNotifica
                 // Drop the stashed handler so we don't leak it forever.
                 self?.handlersQueue.sync { _ = self?.actionHandlers.removeValue(forKey: identifier) }
             }
+            // UN delivers this on a private queue; callers (a pre-quit
+            // relaunch, notably) expect main. Fires for the rejected
+            // case too — the point is "the system has our request, or
+            // never will", not "a banner appeared".
+            guard let completion else { return }
+            DispatchQueue.main.async(execute: completion)
         }
     }
 
@@ -303,12 +334,16 @@ public struct AppleScriptNotifier: Notifier {
         body: String?,
         iconSymbol: String?,
         action: NotificationAction?,
-        onAction: (() -> Void)?
+        onAction: (() -> Void)?,
+        completion: (() -> Void)?
     ) {
         // osascript notifications can't render an action button or a
-        // custom thumbnail. Ignore all extras and post a plain toast.
+        // custom thumbnail. Ignore those extras and post a plain toast.
         _ = (iconSymbol, action, onAction)
         notifyPlain(title: title, body: body)
+        // `notifyPlain` waits on the osascript process, so by here the
+        // system has it (or the shell-out failed and never will).
+        completion?()
     }
 
     private func notifyPlain(title: String, body: String?) {

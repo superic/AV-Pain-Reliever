@@ -225,11 +225,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // crash. Not gated by `notificationsEnabled`: that toggle
         // covers the friendly per-switch toast, not operational
         // notices (same rule as `notifyOfLoadOutcome`).
-        virtualCameraActivator.onStaleDiscoveryRelaunch = { [weak self] in
-            self?.notifier.notify(
+        //
+        // `proceed` is the activator's continuation: it relaunches as
+        // soon as the system has the request, so the wait is however
+        // long the post actually takes (milliseconds) rather than a
+        // fixed guess. A user who denied notification authorization
+        // gets no banner and no error from UN, so the same callback
+        // fires and the relaunch simply isn't delayed for a notice
+        // nobody can see.
+        virtualCameraActivator.onStaleDiscoveryRelaunch = { [weak self] proceed in
+            guard let self else { return }
+            self.notifier.notify(
                 title: NotificationCopy.cameraSelfRestartTitle,
                 body: NotificationCopy.cameraSelfRestartBody,
-                iconSymbol: Theme.Symbol.cameraRecovery
+                iconSymbol: Theme.Symbol.cameraRecovery,
+                action: nil,
+                onAction: nil,
+                completion: proceed
             )
         }
         // User cancelled the macOS auth prompt for a deactivate.

@@ -19,6 +19,20 @@ import Foundation
 ///   see the camera, in whichever process gets there. A later,
 ///   unrelated stale-context episode then gets its own single retry.
 ///
+/// **The invariant every clear point has to keep:** the latch may only
+/// be given back by something *outside* the failing loop — a confirmed
+/// sighting of the camera, or a deliberate user action. Today that
+/// means two call sites: `noteVisibilityConfirmed()` and `disable()`
+/// (the user turned the feature off, which ends the episode as
+/// decisively as a sighting and can't recur without them turning it
+/// back on). Clearing on anything the broken path reaches by itself —
+/// a failed re-check, an escalation declining — would let two
+/// processes hand the latch back and forth and quit each other
+/// forever. `relaunchForStaleDiscovery`'s own abandon/failure paths
+/// are the one exception, and they're safe because no relaunch
+/// happened in them: the process is still alive and has stood its
+/// re-check down.
+///
 /// Not part of `SettingsStore`: this isn't a user preference, it's
 /// crash-and-relaunch bookkeeping, and the activator shouldn't need a
 /// settings reference to do it. Reads never write (missing key →

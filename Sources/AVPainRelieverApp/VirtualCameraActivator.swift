@@ -123,14 +123,28 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// 30s poll and heals the state in place instead of making the
     /// user act on advice that's no longer true.
     private static let visibilityRecheckIntervalSeconds: TimeInterval = 5
-    private static let visibilityRecheckBudgetSeconds: TimeInterval = 120
 
-    /// Head start the user-visible notice gets before the automatic
-    /// stale-discovery relaunch quits the process.
-    /// `UNUserNotificationCenter.add` is asynchronous, and a notice
-    /// that never reaches notificationd would leave the app vanishing
-    /// and reappearing with no explanation.
-    private static let relaunchNoticeLeadSeconds: TimeInterval = 1.5
+    /// Re-check budget, counted in *ticks actually fired* rather than
+    /// wall-clock seconds. A `DispatchSourceTimer` scheduled off
+    /// `.now()` runs on the monotonic clock and doesn't fire while the
+    /// Mac is asleep, but `Date()` keeps advancing — so a wall-clock
+    /// deadline turned a lid-close inside the window into an instant
+    /// "budget expired" at wake, which is the worst moment to spend
+    /// the one-shot relaunch (cameras take seconds to re-enumerate
+    /// after wake). Ticks measure elapsed *active* time, and
+    /// `NSWorkspace.didWakeNotification` resets the count so a wake
+    /// always gets a full fresh window.
+    private static let visibilityRecheckIntervalTickBudget = 24
+    private static var visibilityRecheckBudgetSeconds: TimeInterval {
+        Double(visibilityRecheckIntervalTickBudget) * visibilityRecheckIntervalSeconds
+    }
+
+    /// Upper bound on how long the automatic stale-discovery relaunch
+    /// waits for its user-visible notice to reach the system before
+    /// quitting anyway. Normally the host's notifier reports back in
+    /// milliseconds and the relaunch happens then; this only covers a
+    /// notifier that never calls back at all.
+    private static let relaunchNoticeCapSeconds: TimeInterval = 1.5
 
     @Published private(set) var state: State = .off {
         didSet {
@@ -147,12 +161,15 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// the consumer's wiring site.
     var onVisibilityConfirmed: (() -> Void)?
 
-    /// Fires on the main thread immediately before the automatic
-    /// stale-discovery relaunch quits the host (issue #120). The host
-    /// wires this to a notification so the app disappearing and coming
-    /// back is explained rather than mysterious. Set once during host
+    /// Fires on the main thread when the automatic stale-discovery
+    /// relaunch (issue #120) needs the user told before it quits — an
+    /// agent that vanishes and reappears on its own otherwise reads as
+    /// a crash. The host posts its notice and calls the supplied
+    /// continuation once the system has the request (or immediately
+    /// when it can't post at all); the relaunch happens from there,
+    /// capped by `relaunchNoticeCapSeconds`. Set once during host
     /// setup.
-    var onStaleDiscoveryRelaunch: (() -> Void)?
+    var onStaleDiscoveryRelaunch: ((@escaping () -> Void) -> Void)?
 
     /// Fires on the main thread when the user cancels the macOS auth
     /// prompt that gates a deactivate request. The OS-level deactivate
@@ -213,10 +230,46 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// and by the timer itself once the state moves on.
     private var visibilityRecheckTimer: DispatchSourceTimer?
 
+    /// Re-check ticks fired since the window was armed (or since the
+    /// last wake). See `visibilityRecheckIntervalTickBudget`.
+    private var visibilityRecheckTicks = 0
+
+    /// Wake observer live only while the re-check window is armed.
+    /// Resets the tick count so a sleep/wake inside the window can't
+    /// hand us an escalation the moment the Mac comes back.
+    private var wakeObserver: NSObjectProtocol?
+
     /// Cross-process latch that keeps the automatic stale-discovery
     /// relaunch to one attempt per broken episode. See
     /// `VirtualCameraRelaunchGuard`.
     private let relaunchGuard = VirtualCameraRelaunchGuard()
+
+    /// Pending automatic relaunch, held so it can be cancelled. Both
+    /// `disable()` (user turned the camera off inside the window) and
+    /// `relaunch()` (the Settings button got there first) tear it down
+    /// — `open -n` unconditionally spawns a fresh instance, so a stray
+    /// second call means two live copies of the app.
+    private var pendingRelaunchWorkItem: DispatchWorkItem?
+
+    /// True once `open -n` has actually spawned a replacement. Guards
+    /// the same double-launch, for callers that reach `relaunch()`
+    /// directly rather than through the pending work item.
+    private var relaunchInFlight = false
+
+    /// Whether the relaunch-vs-reboot properties query has answered
+    /// for the current escalation. Only `.clean` — query returned and
+    /// found no copy queued for uninstall-on-reboot — licenses the
+    /// automatic relaunch: on a reboot-required machine a bare
+    /// relaunch provably loops (#110/#112), and an unanswered query
+    /// can't tell us which machine we're on.
+    /// Internal rather than private so `autoRelaunchDecision` can take
+    /// it as a parameter and be tested directly.
+    enum RebootRefinement {
+        case pending
+        case clean
+        case unavailable
+    }
+    private var rebootRefinement: RebootRefinement = .pending
 
     /// Returns true if launch should auto-enable: env-var debug
     /// override OR the user's persisted toggle is on. The env var
@@ -277,6 +330,17 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         logger.notice("Disabling: stopping capture pipeline + deactivating extension")
         endConsumerWatch()
         endVisibilityRecheck()
+        // A pending automatic relaunch is now unwanted: the user has
+        // said they don't want the virtual camera, and quitting the app
+        // out from under that click would be indefensible.
+        pendingRelaunchWorkItem?.cancel()
+        pendingRelaunchWorkItem = nil
+        // Turning the feature off ends the broken episode as
+        // decisively as a confirmed sighting does, so give the
+        // one-shot relaunch back. A user who hits this while the
+        // camera is stuck would otherwise carry a spent latch into a
+        // genuinely new episode weeks later.
+        relaunchGuard.clearRelaunchMarker()
         stopGraceTimer?.cancel()
         stopGraceTimer = nil
         consumerActive = false
@@ -302,7 +366,22 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// "Restart" button on the Settings UI's `.requiresRelaunch`
     /// state, and to the automatic stale-discovery escalation in
     /// `relaunchForStaleDiscovery`.
-    func relaunch() {
+    ///
+    /// Returns true once a replacement instance has been handed to
+    /// Launch Services and termination is queued. False means nothing
+    /// happened and this process is still the only one — the automatic
+    /// escalation reads that to keep its manual advice standing.
+    @discardableResult
+    func relaunch() -> Bool {
+        // Two callers can arrive within milliseconds of each other
+        // (the Settings button and the automatic escalation's timer),
+        // and `open -n` would happily give us two live apps.
+        guard !relaunchInFlight else {
+            logger.notice("relaunch() ignored: a replacement instance is already launching")
+            return false
+        }
+        pendingRelaunchWorkItem?.cancel()
+        pendingRelaunchWorkItem = nil
         let bundleURL = Bundle.main.bundleURL
         logger.notice("Relaunching host: \(bundleURL.path, privacy: .public)")
         let task = Process()
@@ -317,11 +396,13 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
             try task.run()
         } catch {
             logger.error("relaunch open failed: \(error.localizedDescription, privacy: .public)")
-            return
+            return false
         }
+        relaunchInFlight = true
         DispatchQueue.main.async {
             NSApplication.shared.terminate(nil)
         }
+        return true
     }
 
     private func startCapturePipeline() {
@@ -461,7 +542,16 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// process itself is the problem — hand off to
     /// `relaunchForStaleDiscovery`.
     private func beginVisibilityRecheck() {
-        let deadline = Date().addingTimeInterval(Self.visibilityRecheckBudgetSeconds)
+        visibilityRecheckTicks = 0
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            logger.notice("Visibility re-check: woke from sleep, restarting the budget (cameras re-enumerate late after wake)")
+            self.visibilityRecheckTicks = 0
+        }
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(
             deadline: .now() + Self.visibilityRecheckIntervalSeconds,
@@ -475,6 +565,7 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
                 self.endVisibilityRecheck()
                 return
             }
+            self.visibilityRecheckTicks += 1
             if Self.hostCanSeeVirtualCamera() {
                 logger.notice("Visibility re-check: host can see the virtual camera now — recovering to .on, no restart needed")
                 self.endVisibilityRecheck()
@@ -483,8 +574,11 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
                 self.noteVisibilityConfirmed()
                 return
             }
-            if Date() >= deadline {
-                logger.notice("Visibility re-check: still invisible after \(Int(Self.visibilityRecheckBudgetSeconds), privacy: .public)s — in-process discovery is not going to refresh")
+            if self.visibilityRecheckTicks >= Self.visibilityRecheckIntervalTickBudget {
+                // State-neutral line: the diagnosis differs per state
+                // and `relaunchForStaleDiscovery` logs the one that
+                // actually applies.
+                logger.notice("Visibility re-check: budget spent (\(self.visibilityRecheckTicks, privacy: .public) checks over \(Int(Self.visibilityRecheckBudgetSeconds), privacy: .public)s awake) and the camera is still invisible to this process")
                 self.endVisibilityRecheck()
                 // Delete this one line to downgrade the escalation to
                 // offer-only: the state already routes Settings to its
@@ -502,6 +596,10 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     private func endVisibilityRecheck() {
         visibilityRecheckTimer?.cancel()
         visibilityRecheckTimer = nil
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+            self.wakeObserver = nil
+        }
     }
 
     /// Visibility is proven in this process. Spend-once latch for the
@@ -521,41 +619,119 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// exactly what Settings tells the user to do by hand. Do it for
     /// them, once, with a notice.
     ///
-    /// Not offered in `.requiresReboot`: there a stale copy is queued
-    /// for uninstall-on-reboot and a bare relaunch provably loops
-    /// (#110/#112) — that state's recovery is the toggle cycle, and
-    /// the Settings copy already says so.
+    /// Not offered in `.requiresReboot`, nor when the reboot question
+    /// went unanswered: on a machine with a stale copy queued for
+    /// uninstall-on-reboot a bare relaunch provably loops (#110/#112),
+    /// so anything short of a clean properties query keeps the manual
+    /// advice.
     private func relaunchForStaleDiscovery() {
-        guard state == .requiresRelaunch else {
+        // Log the device-list pair before any decision, so the
+        // relaunched-but-still-broken process — the exact one this
+        // diagnostic exists for — records it too.
+        Self.logCMIOCrossCheck(phase: "re-check")
+        switch Self.autoRelaunchDecision(
+            state: state,
+            rebootRefinement: rebootRefinement,
+            latchAvailable: relaunchGuard.canRelaunch
+        ) {
+        case .declineWrongState:
             logger.notice("Stale-discovery relaunch declined: state is \(String(describing: self.state), privacy: .public) — its own recovery advice stands")
             return
-        }
-        guard relaunchGuard.canRelaunch else {
+        case .declineRebootUnresolved:
+            logger.error("Stale-discovery relaunch declined: the relaunch-vs-reboot query never answered, so a relaunch could be the futile kind (#110) — leaving the manual recovery advice in place")
+            return
+        case .declineLatchSpent:
             logger.error("Stale-discovery relaunch declined: this process already came back from one and still can't see the camera — leaving the manual recovery advice in place")
             return
+        case .relaunch:
+            break
         }
-        Self.logCMIOCrossCheck(phase: "re-check")
+        // Marker goes down before the notice, not after: it needs the
+        // notice window to reach cfprefsd before the process dies. The
+        // paths below that don't end in a relaunch hand it back.
         relaunchGuard.markRelaunched()
-        logger.notice("Stale-discovery relaunch: quitting for a fresh CMIO context")
-        onStaleDiscoveryRelaunch?()
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.relaunchNoticeLeadSeconds) { [weak self] in
-            self?.relaunch()
+        logger.notice("Stale-discovery relaunch: in-process discovery is frozen, quitting for a fresh CMIO context")
+
+        let capped = DispatchWorkItem { [weak self] in
+            logger.notice("Stale-discovery relaunch: notice never reported back within \(Self.relaunchNoticeCapSeconds, privacy: .public)s, quitting anyway")
+            self?.performStaleDiscoveryRelaunch()
         }
+        pendingRelaunchWorkItem = capped
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.relaunchNoticeCapSeconds,
+            execute: capped
+        )
+        onStaleDiscoveryRelaunch? { [weak self] in
+            self?.performStaleDiscoveryRelaunch()
+        }
+    }
+
+    /// Quit for a fresh process, now that the user has been told (or
+    /// telling them has provably failed). Idempotent: the notice
+    /// continuation and the cap can both arrive, and `relaunch()`
+    /// refuses a second `open -n` besides.
+    private func performStaleDiscoveryRelaunch() {
+        // The continuation is the host notifier's to call — an
+        // external boundary that could call it twice — and the cap may
+        // have fired first. Once a replacement is launching there's
+        // nothing left to decide.
+        guard !relaunchInFlight else { return }
+        pendingRelaunchWorkItem?.cancel()
+        pendingRelaunchWorkItem = nil
+        // The wait is short but not zero, and the user can act inside
+        // it — a Settings Restart click, a toggle-off, a late heal back
+        // to `.on`. Anything that moved us off `.requiresRelaunch`
+        // owns the outcome now.
+        guard state == .requiresRelaunch else {
+            logger.notice("Stale-discovery relaunch abandoned: state moved to \(String(describing: self.state), privacy: .public) while the notice was in flight")
+            relaunchGuard.clearRelaunchMarker()
+            return
+        }
+        if !relaunch() {
+            // Launch Services refused, so nothing is going to quit and
+            // the re-check has already stood down. Give the latch back
+            // — this episode got no retry at all — and leave the
+            // Settings advice as the way out.
+            logger.error("Stale-discovery relaunch failed to spawn a replacement — manual recovery advice stands")
+            relaunchGuard.clearRelaunchMarker()
+        }
+    }
+
+    /// Whether an automatic relaunch is warranted. Pure and static so
+    /// the decline matrix is unit-testable without AVFoundation, CMIO,
+    /// or a real host process in the loop.
+    static func autoRelaunchDecision(
+        state: State,
+        rebootRefinement: RebootRefinement,
+        latchAvailable: Bool
+    ) -> AutoRelaunchDecision {
+        guard state == .requiresRelaunch else { return .declineWrongState }
+        guard rebootRefinement == .clean else { return .declineRebootUnresolved }
+        guard latchAvailable else { return .declineLatchSpent }
+        return .relaunch
+    }
+
+    enum AutoRelaunchDecision: Equatable {
+        case relaunch
+        case declineWrongState
+        case declineRebootUnresolved
+        case declineLatchSpent
     }
 
     /// Log-only cross-check of the two device lists at an escalation
     /// point. `CMIOObjectGetPropertyData(kCMIOHardwarePropertyDevices)`
     /// re-reads the system list on every call; DiscoverySession answers
     /// from a per-process cache. "CMIO yes, AVFoundation no" is the
-    /// stale-context signature from #120, and the pair of answers is
-    /// what a support log needs to tell that apart from an extension
-    /// that genuinely never published. Deliberately does NOT gate the
-    /// relaunch decision — CMIO's behavior in the stale state hasn't
-    /// been verified on hardware, and the relaunch is the right move
-    /// either way.
+    /// stale-context signature from #120, and both halves are measured
+    /// (not assumed) so a support log can tell that apart from an
+    /// extension that genuinely never published. Deliberately does NOT
+    /// gate the relaunch decision — CMIO's behavior in the stale state
+    /// hasn't been verified on hardware, and the relaunch is the right
+    /// move either way.
     private static func logCMIOCrossCheck(phase: String) {
         let cmioSees = CMIODeviceCatalog.deviceID(forUID: virtualCameraUID) != nil
-        logger.notice("CMIO cross-check (\(phase, privacy: .public)): CMIO sees the device=\(cmioSees, privacy: .public), AVFoundation DiscoverySession does not")
+        let avSees = hostCanSeeVirtualCamera()
+        logger.notice("CMIO cross-check (\(phase, privacy: .public)): CMIO=\(cmioSees, privacy: .public) AVFoundation=\(avSees, privacy: .public)")
     }
 
     /// On disable, if the system-wide preferred camera still points
@@ -702,6 +878,7 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     private var pendingPropertiesRequest: OSSystemExtensionRequest?
 
     private func refineRelaunchEscalation() {
+        rebootRefinement = .pending
         let request = OSSystemExtensionRequest.propertiesRequest(
             forExtensionWithIdentifier: Self.extensionBundleID,
             queue: .main
@@ -720,6 +897,8 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
             let stale = properties.filter(\.isUninstalling)
             guard !stale.isEmpty else {
                 logger.notice("Properties query: no copy queued for uninstall — an app relaunch should recover")
+                // The one answer that licenses the automatic relaunch.
+                self.rebootRefinement = .clean
                 return
             }
             // Only upgrade the escalation the visibility check set.
@@ -801,9 +980,13 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         // — wrong-but-recoverable advice beats surfacing a query
         // error over a working escalation path.
         if request === pendingPropertiesRequest {
-            logger.error("Properties query failed: \(error.localizedDescription, privacy: .public) — keeping .requiresRelaunch")
+            logger.error("Properties query failed: \(error.localizedDescription, privacy: .public) — keeping .requiresRelaunch, and the automatic relaunch stays off the table")
             DispatchQueue.main.async { [weak self] in
                 self?.pendingPropertiesRequest = nil
+                // Unanswered reboot question: `.requiresRelaunch` here
+                // may well be the futile-relaunch machine from #110,
+                // so the escalation stops at manual advice.
+                self?.rebootRefinement = .unavailable
             }
             return
         }

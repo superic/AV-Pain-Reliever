@@ -263,6 +263,27 @@ the extension can't capture"):
   immediately, same path that works on every cold launch). Not
   pretty, but mac OS doesn't expose a userspace API to tear down
   an extension and re-attach in the same process.
+- **Stale per-process CMIO context (#120, 2026-08-30).** The same
+  fresh-process cure, reached by a different route and now applied
+  automatically. After an in-place extension replace, the host's
+  CMIO context can go stale in a way that freezes
+  `AVCaptureDevice.DiscoverySession` for the life of the process:
+  the host polled 30 s and re-checked for 2 minutes without
+  seeing the device while a freshly-launched Zoom opened it fine.
+  So when the #117 re-check budget expires, the activator
+  relaunches itself (`relaunchForStaleDiscovery` →
+  `relaunch()`), after a user-visible notification and gated on
+  the notifier reporting the post accepted. Three things bound it:
+  a `UserDefaults` latch (`VirtualCameraRelaunchGuard`) written
+  before the quit, so the process that comes back knows it already
+  spent its retry and declines to loop; `.requiresReboot` and an
+  unanswered relaunch-vs-reboot properties query are both excluded
+  (a bare relaunch is futile on those machines — #110/#112); and
+  the re-check budget is counted in ticks actually fired, so a
+  sleep/wake inside the window can't spend the latch on a
+  transient. The latch is given back only by a confirmed sighting
+  of the camera or by the user disabling the feature. Decision
+  matrix: `VirtualCameraActivator.autoRelaunchDecision`.
 - **Sparkle + extension replacement edge cases.** Specifically the
   "user has Zoom open with the virtual camera active when v0.2.1
   installs" case. Investigate in M6.
@@ -650,11 +671,13 @@ Architecture:
   contextual button: "Open Login Items & Extensions" when in
   `.needsApproval` / `.failed`, "Restart AV Pain Reliever" when
   in `.requiresRelaunch`. Footer hint adapts to the state
-  (e.g. "Pick 'AV Pain Reliever' in Zoom" when on, "macOS holds
-  the virtual camera in a stale state…" when restart is
-  required). Footer rendered as a `Text` row inside the section
-  body per the project memory's macOS-14 `Form(.grouped)`
-  footer-slot convention.
+  (e.g. "Pick 'AV Pain Reliever' in Zoom" when on, and a
+  cause-agnostic "macOS is holding the virtual camera in a state
+  only a fresh app process can clear…" when a restart is required
+  — reworded in #120, where that state can also be reached with
+  its automatic restart already spent). Footer rendered as a
+  `Text` row inside the section body per the project memory's
+  macOS-14 `Form(.grouped)` footer-slot convention.
 
 ### M5 — release readiness (SHIPPED 2026-05-04)
 
