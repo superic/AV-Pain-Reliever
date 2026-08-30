@@ -101,6 +101,23 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// hangup and the next ring.
     private static let stopGraceSeconds: TimeInterval = 30
 
+    /// Total wall-clock budget for the post-activation visibility
+    /// poll. Was 8s until macOS was observed taking 11s to spawn a
+    /// replaced extension process after an in-place update (issue
+    /// #114) — the poll expired first and produced a false "restart
+    /// your Mac". 30s covers the slow spawn with room to spare; the
+    /// poll exits early the moment the device shows up, so a generous
+    /// budget only costs anything in the genuinely-broken case.
+    private static let visibilityPollBudgetSeconds: TimeInterval = 30
+
+    /// Cadence and budget for the slow re-check that keeps running
+    /// after a visibility timeout escalated to `.requiresRelaunch` /
+    /// `.requiresReboot`. Catches a spawn so late it outran even the
+    /// 30s poll and heals the state in place instead of making the
+    /// user act on advice that's no longer true.
+    private static let visibilityRecheckIntervalSeconds: TimeInterval = 5
+    private static let visibilityRecheckBudgetSeconds: TimeInterval = 120
+
     @Published private(set) var state: State = .off {
         didSet {
             // Skip logging the no-change case. Many call sites
@@ -167,6 +184,14 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// the grace window so we don't tear down then immediately rebuild.
     private var stopGraceTimer: DispatchSourceTimer?
 
+    /// Slow re-check armed after a *visibility timeout* escalated to
+    /// `.requiresRelaunch` / `.requiresReboot`. Only that escalation
+    /// arms it: the `deactivatedThisSession` path genuinely needs a
+    /// fresh process no matter what CMIO later publishes, so it must
+    /// not self-heal. Cancelled on disable(), on a fresh activation,
+    /// and by the timer itself once the state moves on.
+    private var visibilityRecheckTimer: DispatchSourceTimer?
+
     /// Returns true if launch should auto-enable: env-var debug
     /// override OR the user's persisted toggle is on. The env var
     /// is checked first so a developer can force-enable without
@@ -225,6 +250,7 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         }
         logger.notice("Disabling: stopping capture pipeline + deactivating extension")
         endConsumerWatch()
+        endVisibilityRecheck()
         stopGraceTimer?.cancel()
         stopGraceTimer = nil
         consumerActive = false
@@ -342,17 +368,23 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     /// running `AVCaptureDevice.DiscoverySession` and looking for
     /// our extension's UID. If absent, escalate to
     /// `.requiresRelaunch` so Settings can offer the same Restart
-    /// affordance the disable→enable path uses.
+    /// affordance the disable→enable path uses — and hand off to
+    /// `beginVisibilityRecheck`, because a spawn slow enough to blow
+    /// the poll budget can still land afterwards.
     private func scheduleHostVisibilityCheck() {
+        // A Sparkle-driven replace can re-fire `.completed` and land
+        // here while a previous escalation's re-check is still ticking.
+        // The fresh poll supersedes it.
+        endVisibilityRecheck()
         // First check at 1.5s (the calibrated minimum for fresh-launch
         // where CMIO has published and AVFoundation's DiscoverySession
-        // cache has refreshed). On failure, poll every 1s up to 8s
-        // total. The auto-relaunch path (host restarted after a
+        // cache has refreshed). On failure, poll every 1s up to the
+        // full budget. The auto-relaunch path (host restarted after a
         // toggle-off-then-on cycle) often needs 3-5s for the OS to
         // fully republish the extension; a one-shot 1.5s check
         // escalates to `.requiresRelaunch` every time and forces a
         // second relaunch.
-        let deadline = Date().addingTimeInterval(8.0)
+        let deadline = Date().addingTimeInterval(Self.visibilityPollBudgetSeconds)
         pollHostVisibility(deadline: deadline, nextAttemptIn: 1.5)
     }
 
@@ -380,11 +412,61 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
                 // `.requiresRelaunch` keeps today's behavior as the
                 // fallback when the query fails or comes back clean.
                 self.refineRelaunchEscalation()
+                // Either escalation can turn out to be wrong: macOS
+                // sometimes publishes the device long after the poll
+                // gave up. Keep watching so a late spawn heals itself.
+                self.beginVisibilityRecheck()
                 return
             }
             logger.debug("Visibility check: not yet visible, retrying in 1s")
             self.pollHostVisibility(deadline: deadline, nextAttemptIn: 1.0)
         }
+    }
+
+    /// Keep looking for the camera after a visibility timeout sent us
+    /// to `.requiresRelaunch` / `.requiresReboot`. If the extension
+    /// finally shows up, walk the same success path a timely poll
+    /// would have taken — back to `.on`, consumer watch re-armed (the
+    /// escalation tore it down), profile re-applied via
+    /// `onVisibilityConfirmed` — so the stale restart advice
+    /// disappears on its own.
+    private func beginVisibilityRecheck() {
+        let deadline = Date().addingTimeInterval(Self.visibilityRecheckBudgetSeconds)
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + Self.visibilityRecheckIntervalSeconds,
+            repeating: Self.visibilityRecheckIntervalSeconds
+        )
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            // Anything that moved the state elsewhere (disable(), a
+            // re-activation) owns it now — stand down.
+            guard self.state == .requiresRelaunch || self.state == .requiresReboot else {
+                self.endVisibilityRecheck()
+                return
+            }
+            if Self.hostCanSeeVirtualCamera() {
+                logger.notice("Visibility re-check: host can see the virtual camera now — recovering to .on, no restart needed")
+                self.endVisibilityRecheck()
+                self.state = .on
+                self.beginConsumerWatch()
+                self.onVisibilityConfirmed?()
+                return
+            }
+            if Date() >= deadline {
+                logger.notice("Visibility re-check: still invisible after \(Int(Self.visibilityRecheckBudgetSeconds), privacy: .public)s — the restart advice stands")
+                self.endVisibilityRecheck()
+            }
+        }
+        visibilityRecheckTimer?.cancel()
+        visibilityRecheckTimer = timer
+        timer.resume()
+        logger.notice("Visibility re-check armed: every \(Int(Self.visibilityRecheckIntervalSeconds), privacy: .public)s for up to \(Int(Self.visibilityRecheckBudgetSeconds), privacy: .public)s")
+    }
+
+    private func endVisibilityRecheck() {
+        visibilityRecheckTimer?.cancel()
+        visibilityRecheckTimer = nil
     }
 
     /// On disable, if the system-wide preferred camera still points
