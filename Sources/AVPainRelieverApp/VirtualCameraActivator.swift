@@ -325,6 +325,17 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         logger.notice("Stopped host-side capture pipeline")
     }
 
+    /// Real camera the virtual camera is relaying right now: the
+    /// device the capture pipeline actually has open, falling back to
+    /// the name the active profile last asked for while the pipeline
+    /// is between consumers. Nil when no profile has named a camera
+    /// and nothing has been opened yet. Read on the main thread by
+    /// the Settings live preview's status row so it can say which
+    /// source the frames are coming from.
+    var routedSourceName: String? {
+        captureSession?.activeSourceName ?? pendingSourceName
+    }
+
     // MARK: - VirtualCameraSourceController
 
     var preferredCameraOverride: String? {
@@ -489,17 +500,9 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     }
 
     private static func hostCanSeeVirtualCamera() -> Bool {
-        let session = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [
-                .builtInWideAngleCamera,
-                .external,
-                .continuityCamera,
-                .deskViewCamera,
-            ],
-            mediaType: .video,
-            position: .unspecified
-        )
-        return session.devices.contains { $0.uniqueID == Self.virtualCameraUID }
+        CameraDiscovery.session().devices.contains {
+            $0.uniqueID == Self.virtualCameraUID
+        }
     }
 
     // MARK: - Consumer-driven capture lifecycle

@@ -61,6 +61,21 @@ public final class CameraCaptureSession: NSObject {
     /// teardown.
     private var observers: [NSObjectProtocol] = []
 
+    /// `localizedName` of the device currently installed as the
+    /// session's input, or nil before the first successful install.
+    /// Written on `captureQueue` (initial install + every
+    /// `switchSource`), read from the main thread by the Settings
+    /// live preview's status row — hence a lock rather than queue
+    /// confinement.
+    public var activeSourceName: String? {
+        sourceNameLock.lock()
+        defer { sourceNameLock.unlock() }
+        return storedSourceName
+    }
+
+    private let sourceNameLock = NSLock()
+    private var storedSourceName: String?
+
     public init(
         sink: CMIOSinkWriter,
         logger: ApplierLogger,
@@ -265,6 +280,9 @@ public final class CameraCaptureSession: NSObject {
             lockExplicitFormat(on: device)
             currentInput = input
             currentDeviceUniqueID = device.uniqueID
+            sourceNameLock.lock()
+            storedSourceName = device.localizedName
+            sourceNameLock.unlock()
             return true
         } catch {
             logger.error("AVCaptureDeviceInput failed for \(device.localizedName): \(error.localizedDescription)")
