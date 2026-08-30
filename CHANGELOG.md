@@ -57,6 +57,21 @@ universal format support. v0.1.x will keep getting patch releases
 in parallel for anyone who doesn't need any of this. **Money.**
 ```
 
+### Camera extension's frame pump stops burning a core while nobody's watching (2026-08-30)
+
+Fixes #115. Duty-cycle tracing on `debug/idle-cpu-tracing` turned up the cause of a long-standing background CPU cost: Zoom holds the virtual camera's *source* stream open for its entire process lifetime, not just during calls (client-identity tracing showed `us.zoom.xos` connecting at launch and never disconnecting). A held source stream keeps the host's `AVCaptureSession` running and keeps the extension's consume timer alive, so "Zoom is running" meant the full capture pipeline was running around the clock. On one machine that came to 7h40m of extension CPU and 551M context switches over 18.8 days — roughly 1.7% of a core and ~340 wakeups/sec, continuously, mostly outside any call.
+
+Two changes to `CameraExtensionDeviceSource`'s pump:
+
+- The timer no longer passes `.strict`, and leeway goes from 1 ms to 8 ms. `.strict` explicitly opts *out* of timer coalescing, which is exactly backwards here: the pump deliberately oversamples at 3× the 30 fps frame rate so that no individual wakeup has to be punctual. With slack, the kernel can fold our wakeups into ones it was already making.
+- Idle downshift. When the source stream has zero clients **and** the sink has returned empty on ~3 s of consecutive consumes, the timer reschedules to 2 Hz (250 ms leeway). It returns to the full 90 Hz schedule the moment a consume yields a frame, or on the source's 0→1 client edge — `CameraExtensionStreamSource.startStream` already edge-triggers there for the host's consumer-active notification, so the pump restore hangs off the same branch via a new `device?.sourceClientBecameActive()`.
+
+The downshift gate is deliberately conservative in one direction: it never fires while `streamingCounter > 0`, even if the sink is bone dry. A watcher's experience is unchanged, hold-last-frame re-emits included — those ride on these same ticks and cover the ~500 ms input-swap window in `CameraCaptureSession`, so anything that slowed them down would put a visible freeze in a live call. The 2 Hz idle tick (rather than something slower) is also a hedge: if the client edge ever fails to fire, the pump still notices a live sink within half a second on its own.
+
+Threading is unchanged in shape. The timer, its rescheduling, and the empty-run counter all live on `consumeQueue`; `consumeSampleBuffer`'s completion may run elsewhere, so it reads `pumpIsIdle` as a cheap "do I need to do anything?" hint and hops to `consumeQueue` for the actual reschedule. No new locks.
+
+Still open (deliberately out of scope): the host keeps feeding the sink at full rate for a client that holds the stream open but renders nothing. Fixing the extension side caps the damage; not producing the frames at all would be the larger win.
+
 ### Survive a slow extension spawn in the visibility check (2026-08-30)
 
 Fixes #114. The post-activation visibility poll budgeted 8 s (first attempt at 1.5 s, then 1 s intervals) for `AVCaptureDevice.DiscoverySession` in the host process to see the extension's CMIO device. Twice on 2026-08-28, after an in-place extension replace, macOS took **11 s** to spawn the replaced extension process. The poll expired first, escalated to `.requiresRelaunch`, and the #110/#111 properties query then found the pre-replace copy still queued for uninstall-on-reboot and upgraded to `.requiresReboot` — a red "Mac restart required" for a machine that was about to be fine, and the camera did become visible roughly two minutes later. Worse than the wrong advice: the escalation tears down the consumer watch, so any AVCapture client that connected afterwards got a black feed until the user restarted the app a second time.
