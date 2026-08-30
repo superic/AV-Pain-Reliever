@@ -151,7 +151,19 @@ public final class CameraCaptureSession: NSObject {
         logger.info("Initial capture device: \(device.localizedName) (\(device.uniqueID))")
 
         session.beginConfiguration()
-        session.sessionPreset = .hd1280x720
+        // No sessionPreset: never force a specific format onto the
+        // device (the default .high picks from the device's own
+        // supported formats). Same lesson as the videoSettings
+        // comment below, one layer up: .hd1280x720 asks the DEVICE
+        // to run a 720p format, and a capture card only offers the
+        // format of its live HDMI signal (HDMI to U3 capture
+        // delivers 1080p60 only). With the preset forced, a solo
+        // open stalls at zero frames with no error; frames only
+        // flowed while another app had negotiated the device's
+        // native format. `CMIOSinkWriter` normalizes every frame to
+        // the source stream's 1280×720 BGRA via
+        // `VTPixelTransferSession`, so the capture format is free
+        // to be whatever the device actually does.
 
         guard installInput(device: device) else {
             session.commitConfiguration()
@@ -250,12 +262,58 @@ public final class CameraCaptureSession: NSObject {
                 return false
             }
             session.addInput(input)
+            lockExplicitFormat(on: device)
             currentInput = input
             currentDeviceUniqueID = device.uniqueID
             return true
         } catch {
             logger.error("AVCaptureDeviceInput failed for \(device.localizedName): \(error.localizedDescription)")
             return false
+        }
+    }
+
+    /// Explicitly pin `activeFormat` + frame duration on the device.
+    /// USB capture cards (HDMI to U3 capture, 0x1e4e/0x701f) don't
+    /// start their stream for a session that leaves format selection
+    /// to AVFoundation's default pick: `startRunning()` reports
+    /// running, no error fires, and `captureOutput` never delivers.
+    /// The device only wakes for a client that locks a concrete
+    /// format — observed live: our solo session got zero frames for
+    /// minutes, then received its first frame 344 ms after Zoom
+    /// (which pins formats) opened the same device. Picks the
+    /// highest-resolution format (ties broken by max frame rate),
+    /// which for a capture card is the mode of its live input
+    /// signal. Runs after `addInput` so the lock survives the
+    /// session's own configuration pass.
+    private func lockExplicitFormat(on device: AVCaptureDevice) {
+        let best = device.formats.max { a, b in
+            let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
+            let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
+            let pa = Int(da.width) * Int(da.height)
+            let pb = Int(db.width) * Int(db.height)
+            if pa != pb { return pa < pb }
+            let fa = a.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+            let fb = b.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+            return fa < fb
+        }
+        guard let format = best else {
+            logger.error("lockExplicitFormat: \(device.localizedName) reports no formats")
+            return
+        }
+        do {
+            try device.lockForConfiguration()
+            device.activeFormat = format
+            if let range = format.videoSupportedFrameRateRanges
+                .max(by: { $0.maxFrameRate < $1.maxFrameRate })
+            {
+                device.activeVideoMinFrameDuration = range.minFrameDuration
+                device.activeVideoMaxFrameDuration = range.minFrameDuration
+            }
+            device.unlockForConfiguration()
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            logger.info("Locked format on \(device.localizedName): \(dims.width)x\(dims.height) \(FourCC.pretty(CMFormatDescriptionGetMediaSubType(format.formatDescription)))")
+        } catch {
+            logger.error("lockForConfiguration failed for \(device.localizedName): \(error.localizedDescription)")
         }
     }
 
