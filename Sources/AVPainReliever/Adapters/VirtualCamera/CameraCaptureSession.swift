@@ -61,6 +61,18 @@ public final class CameraCaptureSession: NSObject {
     /// teardown.
     private var observers: [NSObjectProtocol] = []
 
+    /// Fires on `captureQueue` every time the set of installed inputs
+    /// changes: the `localizedName` of the camera now on air, or nil
+    /// when the session has no input at all (install failed with no
+    /// previous source to restore, or the device was unplugged).
+    ///
+    /// This is the only honest answer to "which camera is the virtual
+    /// camera relaying right now" — the profile's *requested* name
+    /// isn't, because a requested camera that never opened would still
+    /// read as live. `VirtualCameraActivator` mirrors it onto the main
+    /// thread for the Settings live preview's status row.
+    public var onSourceChange: ((String?) -> Void)?
+
     public init(
         sink: CMIOSinkWriter,
         logger: ApplierLogger,
@@ -85,6 +97,21 @@ public final class CameraCaptureSession: NSObject {
             queue: nil
         ) { [weak self] _ in
             self?.logger.info("AVCaptureSession reported running")
+        })
+        // Device-scoped rather than session-scoped: an unplug takes
+        // the camera off air without any session-level notification,
+        // so without this the session's idea of its source (and the
+        // Settings status row's) would name a camera that's physically
+        // gone.
+        observers.append(center.addObserver(
+            forName: AVCaptureDevice.wasDisconnectedNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] note in
+            guard let device = note.object as? AVCaptureDevice else { return }
+            self?.captureQueue.async {
+                self?.handleDisconnect(of: device)
+            }
         })
     }
 
@@ -265,11 +292,25 @@ public final class CameraCaptureSession: NSObject {
             lockExplicitFormat(on: device)
             currentInput = input
             currentDeviceUniqueID = device.uniqueID
+            onSourceChange?(device.localizedName)
             return true
         } catch {
             logger.error("AVCaptureDeviceInput failed for \(device.localizedName): \(error.localizedDescription)")
             return false
         }
+    }
+
+    /// A camera vanished from the system. If it was ours, the session
+    /// has no source on air any more — AVFoundation drops the input
+    /// without telling the session's observers, so `currentInput` and
+    /// everyone downstream would otherwise keep naming a camera that's
+    /// unplugged. Runs on `captureQueue`.
+    private func handleDisconnect(of device: AVCaptureDevice) {
+        guard device.uniqueID == currentDeviceUniqueID else { return }
+        logger.warn("Source camera disconnected: \(device.localizedName) — no source on air")
+        currentInput = nil
+        currentDeviceUniqueID = nil
+        onSourceChange?(nil)
     }
 
     /// Explicitly pin `activeFormat` + frame duration on the device.
@@ -361,6 +402,7 @@ public final class CameraCaptureSession: NSObject {
                 logger.warn("switchSource: install failed; restored previous source '\(previousUID ?? "<none>")'")
             } else {
                 logger.error("switchSource: install failed and no previous source could be restored — session has no input")
+                onSourceChange?(nil)
             }
         }
         session.commitConfiguration()

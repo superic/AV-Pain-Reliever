@@ -127,6 +127,15 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         }
     }
 
+    /// Camera the capture pipeline actually has open as the virtual
+    /// camera's source right now, or nil when nothing is on air (no
+    /// consumer, install failed, source unplugged). Pushed from
+    /// `CameraCaptureSession.onSourceChange` — deliberately *not*
+    /// derived from the profile's requested camera, which would let
+    /// the Settings status row claim a relay from a camera that never
+    /// opened while the extension replays its cached frame.
+    @Published private(set) var routedSourceName: String?
+
     /// Fires on the main thread when `scheduleHostVisibilityCheck`
     /// confirms `AVCaptureDevice.DiscoverySession` sees the virtual
     /// camera. Set once during host setup; the rationale lives at
@@ -312,6 +321,13 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
             logger: ConsoleLogger(category: "CameraCaptureSession"),
             initialSourceName: pendingSourceName
         )
+        // Fires on the capture queue; mirror onto main because
+        // `routedSourceName` is @Published and SwiftUI reads it.
+        session.onSourceChange = { [weak self] name in
+            DispatchQueue.main.async {
+                self?.routedSourceName = name
+            }
+        }
         session.start()
         sinkWriter = writer
         captureSession = session
@@ -322,6 +338,11 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
         captureSession?.stop()
         captureSession = nil
         sinkWriter = nil
+        // Pipeline gone means no camera on air, whatever the last
+        // install reported. Every caller of this method is already on
+        // the main thread (disable, the consumer-inactive grace timer,
+        // the visibility-poll escalation), so this is a direct write.
+        routedSourceName = nil
         logger.notice("Stopped host-side capture pipeline")
     }
 
@@ -489,17 +510,7 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     }
 
     private static func hostCanSeeVirtualCamera() -> Bool {
-        let session = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [
-                .builtInWideAngleCamera,
-                .external,
-                .continuityCamera,
-                .deskViewCamera,
-            ],
-            mediaType: .video,
-            position: .unspecified
-        )
-        return session.devices.contains { $0.uniqueID == Self.virtualCameraUID }
+        CameraDiscovery.virtualCameraDevice() != nil
     }
 
     // MARK: - Consumer-driven capture lifecycle

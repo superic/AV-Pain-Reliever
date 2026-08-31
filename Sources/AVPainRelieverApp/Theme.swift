@@ -46,6 +46,13 @@ enum Theme {
         /// Warning thumbnail for operational notifications (config
         /// corruption, unrecoverable load failures).
         static let warning = "exclamationmark.triangle"
+
+        /// Settings → Camera live-preview section header.
+        static let livePreviewSection = "eye"
+        /// Placeholder glyph in the live-preview card when there's no
+        /// session to render (virtual camera off, extension missing,
+        /// camera access denied).
+        static let previewUnavailable = "video.slash"
     }
 
     enum Copy {

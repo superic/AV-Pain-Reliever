@@ -13,7 +13,11 @@ import AVFoundation
 /// The session is constructed fresh on every call — sessions are
 /// cheap (microseconds) and we want fresh results when the user
 /// docks a Continuity Camera mid-wizard.
-enum CameraDiscovery {
+///
+/// Public so the app target shares the same list: the activator's
+/// host-visibility check and the Settings live preview both look for
+/// the virtual camera's UID in exactly this set of device types.
+public enum CameraDiscovery {
     /// Includes every camera type that surfaces on macOS 14+:
     ///   - `builtInWideAngleCamera`: the Mac's own webcam
     ///   - `external`: USB / Thunderbolt cameras (LG UltraFine,
@@ -21,7 +25,7 @@ enum CameraDiscovery {
     ///   - `continuityCamera`: iPhone-as-webcam
     ///   - `deskViewCamera`: Apple's perspective-corrected
     ///     ultra-wide variant
-    static func session() -> AVCaptureDevice.DiscoverySession {
+    public static func session() -> AVCaptureDevice.DiscoverySession {
         AVCaptureDevice.DiscoverySession(
             deviceTypes: [
                 .builtInWideAngleCamera,
@@ -32,5 +36,17 @@ enum CameraDiscovery {
             mediaType: .video,
             position: .unspecified
         )
+    }
+
+    /// The embedded virtual camera as AVFoundation sees it, or nil
+    /// when CMIO hasn't published the extension's device to this
+    /// process. Both callers that need to recognize it — the
+    /// activator's host-visibility check and the Settings live
+    /// preview, which opens it as a consumer — go through here so the
+    /// UID match exists once.
+    public static func virtualCameraDevice() -> AVCaptureDevice? {
+        session().devices.first {
+            $0.uniqueID == VirtualCameraIdentity.deviceUID
+        }
     }
 }

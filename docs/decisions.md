@@ -85,12 +85,6 @@ Things a real user might ask for. Not in v1, but kept here for v2 prioritization
 - *Localization.* All in-app strings are currently English literals;
   v2 would migrate to `LocalizedStringResource` / `String(localized:)`
   with `.xcstrings` catalogs. Cool-to-have, not a v1 gate.
-- *Live virtual-camera preview in Settings → Camera tab.* Settings UI
-  becomes a consumer of the virtual camera the same way Zoom is.
-  Doubles as a self-diagnostic so users can see the feed without
-  opening Zoom. Caveat: host-as-consumer interaction has a known bug
-  class (see CHANGELOG "Self-source feedback loop on late consumer
-  connect", 2026-05-05); relevant lesson when implementing.
 
 ---
 
@@ -135,8 +129,11 @@ These were considered and deferred:
   persistent todo, not a gate. Target is 80% line coverage on non-UI
   files; SwiftUI views and OS-integration code excluded by design
   (they need snapshot or integration tests, not unit tests).
-- *Live virtual-camera preview in Settings:* listed in Scope creep
-  candidates for v2.
+- *Live virtual-camera preview in Settings:* shipped 2026-08-30
+  (issue #119), ahead of the v2 list it had been parked on. The
+  Settings UI is now a plain consumer of the published CMIO device,
+  and the self-source guard it had to respect is documented in the
+  CHANGELOG entry.
 - *Localization:* listed in Scope creep candidates for v2.
 - *External user count threshold:* considered, dropped as a gate
   because chasing a number distracts from quality signal.
