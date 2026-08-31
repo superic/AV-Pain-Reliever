@@ -769,5 +769,22 @@
                        type="application/octet-stream"
                        sparkle:edSignature="4sXCPf/LBOEzXIeinbxHL6+5xQCk9aV3RSIcrn8RPUBvMIoqAugKoI34jtl4JBW7XNy63EtI7NqPcuGXzvCDCw==" length="3314786" />
         </item>
+        <item>
+            <title>Version 0.2.0.22-dev.1</title>
+            <description><![CDATA[
+<p>Two quality-of-life moves in this one, and they're both about trust.</p>
+<p>First: Settings → Camera has a live preview now. A real one. It opens the virtual camera exactly the way Zoom opens it, so when that picture is moving, the whole pipeline is moving: extension, relay, frames, everything. Full width, mirrored like every self-view should be, with a status line that names the frame rate and the camera actually on the air. And it's honest: if you're looking at a held frame instead of live video, it says so instead of flashing a green dot at you.</p>
+<p>Second: you know the move where the camera goes invisible after an update and the answer was "restart the app"? The app knows the move too. Now it notices when macOS has frozen its view of the camera, posts a heads-up, restarts itself once, and comes back seeing clearly. Once. Never a loop. And if a restart wouldn't actually fix your situation, it skips the theater and gives you the advice that will.</p>
+<p>Money.</p>
+]]></description>
+            <pubDate>Mon, 31 Aug 2026 01:50:03 +0000</pubDate>
+            <sparkle:channel>dev</sparkle:channel>
+            <sparkle:version>0.2.0.22-dev.1</sparkle:version>
+            <sparkle:shortVersionString>0.2.0.22-dev.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/superic/av-pain-reliever/releases/download/v0.2.0.22-dev.1/AVPainReliever.app.zip"
+                       type="application/octet-stream"
+                       sparkle:edSignature="UrAcjudP0DAvLs9a6PSgcLFIiU+e6XdpiR9QzjdJYITDUsFpsxCG6MaJImW//H7flSXZOyA9yYjWzwSmCbGaBw==" length="3381334" />
+        </item>
     </channel>
 </rss>
