@@ -46,7 +46,17 @@ struct SettingsView: View {
 
             CameraSettingsTab(
                 settings: settings,
-                activator: delegate.virtualCameraActivator
+                activator: delegate.virtualCameraActivator,
+                // The live preview opens the virtual camera as a real
+                // consumer, so it must run only while this tab is the
+                // one on screen. Selection-driven rather than
+                // `onAppear`-driven because macOS `TabView` builds
+                // every tab's body up front; `onAppear` alone would
+                // start the pipeline the moment Settings opened on
+                // any tab. Closing the window resets `settingsTab` to
+                // `.general` (see `onDisappear` below), so the close
+                // path turns the preview off through the same flag.
+                isVisible: delegate.settingsTab == .camera
             )
                 .tabItem {
                     Label("Camera", systemImage: "camera")
@@ -59,7 +69,11 @@ struct SettingsView: View {
                 }
                 .tag(SettingsTab.stats)
         }
-        .frame(width: 480, height: 380)
+        // 460 rather than the original 380: the Camera tab now carries
+        // the live-preview card, and the point of a preview is to be
+        // visible at a glance rather than one scroll down. The other
+        // tabs just get more breathing room.
+        .frame(width: 480, height: 460)
         .centeredOnScreen()
         // Reset to General on close so the next open starts at the
         // first tab. Apple's own System Settings does the same. The
@@ -67,6 +81,13 @@ struct SettingsView: View {
         // mutates `settingsTab = .profiles` right before opening,
         // and `.onDisappear` only fires when the previous session
         // closed — so the override survives the next open.
+        //
+        // Load-bearing beyond tab bookkeeping: the Camera tab's live
+        // preview runs while `settingsTab == .camera`, so this reset is
+        // one of the paths that shuts the capture session (and the real
+        // camera) down when the window closes. The others are the
+        // card's own `onDisappear` and the controller's `deinit`. Don't
+        // drop it without checking `VirtualCameraPreviewCard`.
         .onDisappear {
             delegate.settingsTab = .general
         }
@@ -79,9 +100,20 @@ struct SettingsView: View {
 /// Installing requires user approval through System Settings, so
 /// the section explains what's about to happen and surfaces a
 /// status row that mirrors the activator's state machine.
+///
+/// Below that, a live preview of the virtual camera's actual output.
+/// It's a plain AVCapture consumer of the published CMIO device, not a
+/// window onto host internals, so it exercises the whole chain a video
+/// app depends on — publish, consumer notification, host capture
+/// spin-up, frame relay — and its status row answers "is this thing
+/// streaming?" without a log trace.
 private struct CameraSettingsTab: View {
     @ObservedObject var settings: SettingsStore
     @ObservedObject var activator: VirtualCameraActivator
+    /// True while this is the selected Settings tab. Gates the live
+    /// preview's capture session; see the call site for why selection
+    /// rather than `onAppear` is the signal.
+    let isVisible: Bool
     // Intercept-before-apply: when the user toggles OFF, hold the
     // confirmation up before flipping the underlying setting.
     // Rolling back a deactivation after the fact would push the
@@ -123,6 +155,21 @@ private struct CameraSettingsTab: View {
             } header: {
                 Label("Virtual camera", systemImage: "camera.metering.center.weighted")
             }
+
+            Section {
+                VirtualCameraPreviewCard(
+                    activator: activator,
+                    isTabVisible: isVisible
+                )
+                // Helper text as the last row in the section body —
+                // `footer:` is constrained on macOS 14.
+                Text("The preview opens the virtual camera the same way a video app does, so the camera light comes on while this tab is showing. Switching tabs or closing this window stops it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } header: {
+                Label("Live preview", systemImage: Theme.Symbol.livePreviewSection)
+            }
         }
         .groupedFormChrome()
         .alert(
@@ -160,9 +207,7 @@ private struct CameraSettingsTab: View {
     /// repaints on every activator state transition.
     private var statusRow: some View {
         HStack(spacing: 8) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 8, height: 8)
+            StatusDot(tint: statusColor)
             Text(statusLabel)
                 .font(.callout)
             Spacer()

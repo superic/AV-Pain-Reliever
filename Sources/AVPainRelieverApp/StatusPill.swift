@@ -26,3 +26,17 @@ struct StatusPill: View {
             .background(tint, in: Capsule())
     }
 }
+
+/// The 8pt tinted dot that leads a one-line status sentence — the
+/// virtual-camera extension state row and the live-preview feed row
+/// both use it. Extracted so the two rows can't drift apart in size
+/// or shape.
+struct StatusDot: View {
+    let tint: Color
+
+    var body: some View {
+        Circle()
+            .fill(tint)
+            .frame(width: 8, height: 8)
+    }
+}

@@ -51,6 +51,13 @@ enum Theme {
         /// Reads as "camera, being cycled" rather than "camera broken"
         /// — the app is already fixing it by the time this shows up.
         static let cameraRecovery = "arrow.triangle.2.circlepath.camera"
+
+        /// Settings → Camera live-preview section header.
+        static let livePreviewSection = "eye"
+        /// Placeholder glyph in the live-preview card when there's no
+        /// session to render (virtual camera off, extension missing,
+        /// camera access denied).
+        static let previewUnavailable = "video.slash"
     }
 
     enum Copy {
