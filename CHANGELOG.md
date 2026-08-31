@@ -57,6 +57,10 @@ universal format support. v0.1.x will keep getting patch releases
 in parallel for anyone who doesn't need any of this. **Money.**
 ```
 
+### Preview card goes full width (2026-08-30)
+
+Follow-up to #121 after seeing it in use: the fixed 256×144 preview floating centered in the card left dead gutters that read as an accident, not an inset. The surface now spans the row at a fixed 16:9 (`aspectRatio` on the container; `.resizeAspect` inside the layer still letterboxes a non-16:9 source onto the black background rather than stretching), which makes the picture ~75% larger — better for the frozen-vs-live judgment the feature exists for. Settings window grows 460 → 560 so the Camera tab still shows the whole card without scrolling.
+
 ### Self-heal escalates to an automatic app relaunch when in-process discovery is frozen (2026-08-30)
 
 Fixes #120. First field run of #117's self-heal produced the case it can't fix. After an in-place extension replace plus a toggle cycle, a fresh app process (15:14:08) polled `AVCaptureDevice.DiscoverySession` for 30 s, re-checked every 5 s for another 2 minutes, and never saw the virtual camera (15:16:46 "the restart advice stands"). Zoom — also a fresh process — opened that same device's source stream 70 s later at 15:17:56. With the consumer watch torn down by the escalation, that connect went unnoticed and the user got a black feed until they restarted the app by hand, which confirmed visibility in 1.5 s.

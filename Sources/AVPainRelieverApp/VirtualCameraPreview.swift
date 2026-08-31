@@ -148,12 +148,12 @@ struct VirtualCameraPreviewCard: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .frame(width: 256, height: 144)
+        .aspectRatio(16 / 9, contentMode: .fit)
+        .frame(maxWidth: .infinity)
         .overlay(
             RoundedRectangle(cornerRadius: 6)
                 .strokeBorder(.separator)
         )
-        .frame(maxWidth: .infinity, alignment: .center)
     }
 }
 

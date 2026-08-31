@@ -69,11 +69,11 @@ struct SettingsView: View {
                 }
                 .tag(SettingsTab.stats)
         }
-        // 460 rather than the original 380: the Camera tab now carries
-        // the live-preview card, and the point of a preview is to be
-        // visible at a glance rather than one scroll down. The other
-        // tabs just get more breathing room.
-        .frame(width: 480, height: 460)
+        // Taller than the original 380: the Camera tab carries the
+        // live-preview card (full row width, 16:9), and the point of a
+        // preview is to be visible at a glance rather than one scroll
+        // down. The other tabs just get more breathing room.
+        .frame(width: 480, height: 560)
         .centeredOnScreen()
         // Reset to General on close so the next open starts at the
         // first tab. Apple's own System Settings does the same. The
