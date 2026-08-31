@@ -486,6 +486,10 @@ private struct CapturePreviewLayerView: NSViewRepresentable {
 
     func updateNSView(_ view: PreviewHostView, context: Context) {
         view.previewLayer.session = session
+        // Covers attaching to a session that was already running
+        // (fast tab flips outrun the stop), where the start
+        // notification fired before this view existed.
+        view.applyMirroring()
     }
 
     final class PreviewHostView: NSView {
@@ -501,6 +505,30 @@ private struct CapturePreviewLayerView: NSViewRepresentable {
             previewLayer.videoGravity = .resizeAspect
             previewLayer.cornerRadius = 6
             previewLayer.masksToBounds = true
+            // The preview connection only exists once the session
+            // gains its input on the capture queue, so mirroring is
+            // applied when the session reports it started running.
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(sessionDidStartRunning(_:)),
+                name: .AVCaptureSessionDidStartRunning,
+                object: nil
+            )
+        }
+
+        @objc private func sessionDidStartRunning(_ note: Notification) {
+            guard (note.object as? AVCaptureSession) === previewLayer.session else { return }
+            DispatchQueue.main.async { [weak self] in self?.applyMirroring() }
+        }
+
+        /// Mirror like every macOS self-view. Preview-only: the
+        /// virtual camera's output to video apps is untouched — they
+        /// apply their own self-view mirroring.
+        func applyMirroring() {
+            guard let connection = previewLayer.connection,
+                  connection.isVideoMirroringSupported else { return }
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = true
         }
 
         required init?(coder: NSCoder) {
