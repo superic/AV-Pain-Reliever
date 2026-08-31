@@ -47,6 +47,11 @@ enum Theme {
         /// corruption, unrecoverable load failures).
         static let warning = "exclamationmark.triangle"
 
+        /// Thumbnail for the automatic camera-recovery restart notice.
+        /// Reads as "camera, being cycled" rather than "camera broken"
+        /// — the app is already fixing it by the time this shows up.
+        static let cameraRecovery = "arrow.triangle.2.circlepath.camera"
+
         /// Settings → Camera live-preview section header.
         static let livePreviewSection = "eye"
         /// Placeholder glyph in the live-preview card when there's no

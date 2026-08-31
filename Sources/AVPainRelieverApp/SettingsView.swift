@@ -262,7 +262,12 @@ private struct CameraSettingsTab: View {
         case .failed:
             return "Activation didn't complete. Open System Settings → General → Login Items & Extensions to check the extension's state, then toggle this off and on to retry."
         case .requiresRelaunch:
-            return "macOS holds the virtual camera in a stale state after toggling off and back on inside one session. Restart the app to re-enable it cleanly."
+            // Cause-agnostic on purpose. Two different faults land
+            // here — an in-session toggle off/on, and a stale CMIO
+            // context after an extension replace — and the second one
+            // has already spent its automatic restart by the time the
+            // user is reading this. Both cures are the same button.
+            return "macOS is holding the virtual camera in a state only a fresh app process can clear. Restart the app to re-enable it cleanly."
         case .requiresReboot:
             return "A previous version of the camera extension is still queued for removal, which can keep the new one hidden. Toggle this off and back on to re-register it, then restart the app if prompted. If the camera still doesn't appear, restart your Mac."
         }

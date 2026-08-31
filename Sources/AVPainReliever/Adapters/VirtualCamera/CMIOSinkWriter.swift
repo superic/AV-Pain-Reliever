@@ -89,7 +89,7 @@ public final class CMIOSinkWriter {
     /// All failures log via the injected `ApplierLogger`; caller
     /// decides whether to retry.
     func start() -> Bool {
-        guard let device = findDevice(matchingUID: deviceUID) else {
+        guard let device = CMIODeviceCatalog.deviceID(forUID: deviceUID) else {
             logger.error("CMIO device with UID \(self.deviceUID) not found")
             return false
         }
@@ -209,58 +209,6 @@ public final class CMIOSinkWriter {
     }
 
     // MARK: - CMIO discovery
-
-    private func findDevice(matchingUID uid: String) -> CMIODeviceID? {
-        var address = CMIOObjectPropertyAddress(
-            mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyDevices),
-            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
-            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
-        )
-        var dataSize: UInt32 = 0
-        guard
-            CMIOObjectGetPropertyDataSize(
-                CMIOObjectID(kCMIOObjectSystemObject),
-                &address, 0, nil,
-                &dataSize
-            ) == noErr,
-            dataSize > 0
-        else { return nil }
-
-        let count = Int(dataSize) / MemoryLayout<CMIOObjectID>.size
-        var devices = [CMIOObjectID](repeating: 0, count: count)
-        var dataUsed: UInt32 = 0
-        guard
-            CMIOObjectGetPropertyData(
-                CMIOObjectID(kCMIOObjectSystemObject),
-                &address, 0, nil,
-                dataSize, &dataUsed,
-                &devices
-            ) == noErr
-        else { return nil }
-
-        for device in devices {
-            guard let candidate = copyDeviceUID(deviceID: device) else { continue }
-            if candidate.caseInsensitiveCompare(uid) == .orderedSame {
-                return device
-            }
-        }
-        return nil
-    }
-
-    private func copyDeviceUID(deviceID: CMIODeviceID) -> String? {
-        var address = CMIOObjectPropertyAddress(
-            mSelector: CMIOObjectPropertySelector(kCMIODevicePropertyDeviceUID),
-            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
-            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
-        )
-        var size: UInt32 = UInt32(MemoryLayout<CFString>.size)
-        var uid: Unmanaged<CFString>?
-        let status = CMIOObjectGetPropertyData(
-            deviceID, &address, 0, nil, size, &size, &uid
-        )
-        guard status == noErr, let unmanaged = uid else { return nil }
-        return unmanaged.takeRetainedValue() as String
-    }
 
     private func findSinkStream(deviceID: CMIODeviceID) -> CMIOStreamID? {
         var address = CMIOObjectPropertyAddress(
