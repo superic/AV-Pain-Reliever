@@ -35,7 +35,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # No Select Xcode step on self-hosted — the runner uses
       # whichever Xcode is at /Applications/Xcode.app on the dev's
