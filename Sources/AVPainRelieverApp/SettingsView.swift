@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import AVPainReliever
+import AVPainRelieverSharedConstants
 
 /// Stable identifiers for the Settings tabs. Bound to the TabView's
 /// selection so callers (e.g. the menu's "Edit Profiles…" item) can
@@ -149,6 +150,24 @@ private struct CameraSettingsTab: View {
                 // section body — `footer:` is constrained on
                 // macOS 14, locked convention per project memory.
                 Text(explanationText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // No-signal placeholder (issue #125). Disabled while
+                // the virtual camera itself is off: the extension is
+                // deactivated in that state (see the doc comment on
+                // `SettingsStore.virtualCameraEnabled`), so the
+                // picker would otherwise look live while doing
+                // nothing until the toggle above is turned on.
+                Picker("No-signal placeholder", selection: $settings.noSignalMode) {
+                    Text("Black").tag(NoSignalMode.black)
+                    Text("Test pattern").tag(NoSignalMode.testPattern)
+                    Text("Static").tag(NoSignalMode.staticNoise)
+                }
+                .disabled(!settings.virtualCameraEnabled)
+
+                Text("Shown when the camera you picked isn't sending a picture yet.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

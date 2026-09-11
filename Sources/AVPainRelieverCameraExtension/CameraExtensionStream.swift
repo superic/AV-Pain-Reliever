@@ -34,8 +34,9 @@ final class CameraExtensionStreamSource: NSObject, CMIOExtensionStreamSource {
     weak var device: CameraExtensionDeviceSource?
 
     /// Number of currently-active CMIO clients reading this stream.
-    /// `device` checks this before forwarding consumed frames so we
-    /// don't waste cycles encoding when no one's watching.
+    /// Only ever touched on the CMIO thread that delivers
+    /// `startStream` / `stopStream`; the device learns about it from
+    /// the 0↔1 edges below rather than reading it across threads.
     private(set) var streamingCounter: UInt32 = 0
 
     static let frameWidth: Int32 = 1280
@@ -147,10 +148,13 @@ final class CameraExtensionStreamSource: NSObject, CMIOExtensionStreamSource {
         streamingCounter += 1
         logger.info("source startStream — streamingCounter=\(self.streamingCounter, privacy: .public)")
         // Edge-trigger only: a 0→1 transition is the moment the host
-        // needs to spin up its capture pipeline, and the moment our
-        // own consume pump has to leave its idle cadence. Subsequent
-        // clients joining a stream that's already live don't need to
-        // wake anything up.
+        // needs to spin up its capture pipeline, the moment our own
+        // consume pump has to leave its idle cadence, and the moment
+        // the device drops any frame it cached before this client
+        // existed (see `sourceClientBecameActive`). Subsequent clients
+        // joining a stream that's already live don't need to wake
+        // anything up — and the frame they'd inherit is one this
+        // session already broadcast.
         if wasIdle {
             device?.sourceClientBecameActive()
             CFNotificationCenterPostNotification(
@@ -164,7 +168,12 @@ final class CameraExtensionStreamSource: NSObject, CMIOExtensionStreamSource {
     func stopStream() throws {
         if streamingCounter > 0 { streamingCounter -= 1 }
         logger.info("source stopStream — streamingCounter=\(self.streamingCounter, privacy: .public)")
+        // Edge-trigger again on the way down: 1→0 is the moment the
+        // host can shut its capture pipeline off, and the moment the
+        // device's pump has nothing left to emit to (see
+        // `sourceClientBecameInactive`).
         if streamingCounter == 0 {
+            device?.sourceClientBecameInactive()
             CFNotificationCenterPostNotification(
                 CFNotificationCenterGetDarwinNotifyCenter(),
                 CFNotificationName(Self.consumerInactiveNotification as CFString),

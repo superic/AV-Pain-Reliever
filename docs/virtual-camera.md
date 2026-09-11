@@ -221,7 +221,68 @@ the extension can't capture"):
   for as long as the sink stays empty AND a client is watching.
   Verified on a manual switch from `home-office` → `laptop` on
   2026-05-04: cold-start gap on first client connect was covered by
-  one held emit before fresh frames took over.
+  one held emit before fresh frames took over. Revisited in #125
+  (2026-09-11): "for as long as the sink stays empty" turned out to
+  be the bug, not the feature — a camera that never resumed
+  delivering held a *previous session's* frame on screen
+  indefinitely, which the writeup below bounds. See "No-signal
+  placeholder" immediately below.
+- **No-signal placeholder for a dry sink past the hold window
+  (#125, 2026-09-11).** `NoSignalPolicy.holdWindowNs` now caps the
+  held-frame re-emit at 2 s of dry sink, but the bound that actually
+  closes the privacy hole is separate: `CameraExtensionDeviceSource`
+  drops its cached frame outright the instant a consumer attaches
+  (`sourceClientBecameActive`, the source stream's 0→1
+  `streamingCounter` edge) and the instant the sink stops, so
+  `hasHeldFrame` is false at the top of every call — a client can
+  never inherit a frame cached before it existed, timer or no timer.
+  `holdWindowNs` is left covering only a mid-session dry spell (a
+  profile swap), which is the case it was designed for.
+
+  Past the window, or with nothing cached to hold, `CameraExtension
+  DeviceSource.maybeEmitDryTickFrame` (formerly
+  `maybeEmitHeldFrame`) sends a placeholder rather than leaving the
+  source silent. `NoSignalPolicy.decide(hasWatchers:hasHeldFrame:
+  dryDurationNs:)` is the pure function choosing among hold /
+  placeholder / idle for each dry tick, and `NoSignalFrameSource`
+  renders whichever `NoSignalMode` is active: `.black` (default,
+  one immutable buffer reused forever), `.testPattern` (SMPTE-style
+  bars, same immutable-buffer shape), or `.staticNoise` (animated —
+  a fresh field drawn per frame from a `CVPixelBufferPool`, since
+  frozen noise reads as a corrupted still rather than as snow).
+
+  The mode is picked in Settings → Camera and crosses the process
+  boundary the same way every other extension-facing setting would
+  have to: `SettingsStore.noSignalMode`'s `didSet` writes the raw
+  value into the shared `HLH4LEWS9S.group.com.ericwillis.avpainreliever`
+  App Group container (`NoSignalSharedStore`) — the extension can't
+  see `UserDefaults.standard` — and posts a payload-free
+  `CameraExtensionNotifications.noSignalModeChanged` Darwin
+  notification that means only "re-read the key." `AppDelegate`
+  fires one more copy of that at launch, since a `didSet` doesn't run
+  for `init`'s own assignment and a host that never touches the
+  picker would otherwise leave a freshly-spawned extension reading a
+  stale container.
+
+  Placeholder frames ride the same source stream live frames do,
+  which broke the #119 preview's fps-based status: a source frame
+  count alone can't tell a placeholder from a live picture, so a
+  dead camera would have read as a healthy "Relaying 30 fps."
+  `CMIOSinkWriter` now exposes `deliveredFrameCount` — incremented
+  only when the host hands the sink a genuine frame — as
+  `VirtualCameraActivator.hostDeliveredFrameCount`, and
+  `VirtualCameraPreviewStatus` derives a new `.showingPlaceholder`
+  state whenever source frames are arriving but the host hasn't
+  delivered one in `holdWindowNs` plus one preview sampling tick.
+  `.waitingForFrames` narrows accordingly: it now means a session
+  that has never received anything at all, with the "camera
+  connected but not delivering" shape (#113) reporting through
+  `.showingPlaceholder` instead.
+
+  Known limitation, not closed here: the dry-tick pump only runs
+  while the host app holds the sink open, so a host that isn't
+  running at all still shows a frameless stream to any client that
+  opens the camera — same as before this issue.
 - **Behavior when no source camera is available** (profile says
   camera X, X is unplugged). Currently logged as
   `virtual camera source 'X' not found — skipping`; the running

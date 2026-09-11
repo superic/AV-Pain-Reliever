@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import AVPainReliever
+import AVPainRelieverSharedConstants
 import os.log
 
 private let logger = Logger(
@@ -12,10 +13,20 @@ private let logger = Logger(
 ///
 /// Derived from the preview's own `AVCaptureSession` — the same kind
 /// of session any video app opens on the published CMIO device — so a
-/// green status here means a real consumer got real frames through the
+/// green status means a real consumer got real frames through the
 /// real pipeline: extension published, consumer notification
-/// delivered, host capture spun up, frames relayed. Nothing in here
-/// peeks at host-internal state.
+/// delivered, host capture spun up, frames relayed.
+///
+/// Frame *arrival* alone stopped proving that last step once the
+/// extension gained its no-signal placeholder: past
+/// `NoSignalPolicy.holdWindowNs` of a dry sink it synthesises frames
+/// and sends those down the source stream, and no consumer can tell
+/// them from live video by looking. So exactly one host-internal fact
+/// crosses into this derivation — `VirtualCameraActivator
+/// .hostDeliveredFrameCount`, the host's own count of frames it put
+/// into the sink — and it is what separates `.streaming` from
+/// `.showingPlaceholder`. Green still means live video from a named
+/// camera; it just takes two signals to say so now.
 enum VirtualCameraPreviewStatus: Equatable {
     /// Preview isn't running: the Camera tab isn't showing, or the
     /// extension isn't in the `.on` state.
@@ -28,13 +39,25 @@ enum VirtualCameraPreviewStatus: Equatable {
     /// deliver anything.
     case accessDenied
     /// Session is running on the virtual camera and has never
-    /// received a frame. Means the extension has no cached frame to
-    /// forward, i.e. the host's source camera isn't delivering.
+    /// received a frame — the extension is sending nothing at all.
+    ///
+    /// Narrower than it used to be. "Host camera is dead" used to land
+    /// here, because a dry sink meant a silent source stream; the
+    /// placeholder now fills that silence, and
+    /// `.showingPlaceholder` is where that fault reports. What's left
+    /// is the opening moment of a session and an extension that isn't
+    /// pumping.
     case waitingForFrames
     /// Frames were arriving and then stopped.
     case stalled
     /// Frames arriving, measured over the last sampling window.
     case streaming(fps: Int)
+    /// Frames are arriving, but the host hasn't put one into the sink
+    /// for `hostDeliveryGraceSeconds` — so what's on screen is the
+    /// extension's no-signal placeholder, not the user's camera. The
+    /// pipeline is healthy end to end; the camera at the end of it
+    /// isn't sending.
+    case showingPlaceholder
 
     /// True when the video surface should be shown. In every other
     /// case there's no session to render and the card shows a
@@ -42,7 +65,7 @@ enum VirtualCameraPreviewStatus: Equatable {
     var showsVideoSurface: Bool {
         switch self {
         case .idle, .deviceMissing, .accessDenied: return false
-        case .waitingForFrames, .stalled, .streaming: return true
+        case .waitingForFrames, .stalled, .streaming, .showingPlaceholder: return true
         }
     }
 
@@ -71,6 +94,11 @@ enum VirtualCameraPreviewStatus: Equatable {
                 return "Holding the last frame — no source camera is open."
             }
             return "Relaying \(fps) fps from \(sourceName)."
+        case .showingPlaceholder:
+            guard let sourceName else {
+                return "No picture from your camera — showing the no-signal placeholder."
+            }
+            return "No picture from \(sourceName) — showing the no-signal placeholder."
         }
     }
 
@@ -83,11 +111,80 @@ enum VirtualCameraPreviewStatus: Equatable {
             return .secondary
         case .deviceMissing, .accessDenied:
             return Theme.Color.error
-        case .waitingForFrames, .stalled:
+        case .waitingForFrames, .stalled, .showingPlaceholder:
             return Theme.Color.warn
         case .streaming:
             return sourceName == nil ? Theme.Color.warn : Theme.Color.success
         }
+    }
+
+    /// How long the host can go without handing a frame to the sink
+    /// before frames still arriving on the source get attributed to the
+    /// extension's placeholder rather than to a live camera.
+    ///
+    /// Two terms, both load-bearing. `NoSignalPolicy.holdWindowNs` is
+    /// the extension's own switchover point: inside it the source is
+    /// re-emitting a real cached frame, so calling "placeholder" any
+    /// earlier would be a lie about pixels that are genuinely the
+    /// user's. On top of that the preview only looks once per
+    /// `VirtualCameraPreviewController.sampleInterval`, so an enqueue
+    /// landing just after a tick isn't seen until the next one, and a
+    /// window measured to tick granularity needs a tick of slack.
+    ///
+    /// Sum is the earliest instant at which a dry host provably means
+    /// placeholder pixels. Erring longer is the cheap direction: a
+    /// slow-but-real source — a capture card at a few fps, comfortably
+    /// inside the hold window — keeps reading as the live camera it is,
+    /// and the cost of the extra second is a green row that lags a real
+    /// fault by one tick.
+    static let hostDeliveryGraceSeconds: TimeInterval =
+        Double(NoSignalPolicy.holdWindowNs) / Double(NSEC_PER_SEC)
+        + VirtualCameraPreviewController.sampleInterval
+
+    /// The whole status derivation, as a pure function of the two
+    /// counts the sampling tick collects. Split out so the matrix is
+    /// testable without a CMIO stack, following
+    /// `VirtualCameraActivator.autoRelaunchDecision`.
+    ///
+    /// - Parameters:
+    ///   - sourceFrames: frames the preview's own output delivered
+    ///     during the window — placeholder and live alike, since the
+    ///     source stream doesn't distinguish them.
+    ///   - windowSeconds: length of that window, measured rather than
+    ///     assumed (timer leeway drifts it).
+    ///   - everDelivered: whether this session has ever seen a frame,
+    ///     which is what separates "never started" from "stopped".
+    ///   - hostEverDelivered: whether `VirtualCameraActivator
+    ///     .hostDeliveredFrameCount` has moved at all in this sampling
+    ///     session. Mirrors `everDelivered` one level down: that one
+    ///     tells "never started" from "stopped" for the *source*, this
+    ///     one tells it for the *host*. The grace window below is only
+    ///     for the second case — a host that proved it was alive and
+    ///     then went quiet earns the benefit of the doubt for
+    ///     `hostDeliveryGraceSeconds`. A host that has never delivered
+    ///     has proven nothing, so there is no doubt to give the benefit
+    ///     of: `false` here means placeholder immediately, independent
+    ///     of `hostDrySeconds`.
+    ///   - hostDrySeconds: time since `VirtualCameraActivator
+    ///     .hostDeliveredFrameCount` last moved. Meaningless when
+    ///     `hostEverDelivered` is `false` (there is no "last moved" to
+    ///     measure from yet) and not consulted in that case.
+    static func derive(
+        sourceFrames: Int,
+        windowSeconds: TimeInterval,
+        everDelivered: Bool,
+        hostEverDelivered: Bool,
+        hostDrySeconds: TimeInterval
+    ) -> VirtualCameraPreviewStatus {
+        guard sourceFrames > 0 else {
+            return everDelivered ? .stalled : .waitingForFrames
+        }
+        guard hostEverDelivered, hostDrySeconds < hostDeliveryGraceSeconds else {
+            return .showingPlaceholder
+        }
+        return .streaming(
+            fps: max(1, Int((Double(sourceFrames) / windowSeconds).rounded()))
+        )
     }
 }
 
@@ -108,7 +205,21 @@ struct VirtualCameraPreviewCard: View {
     /// the preview off through the same path a tab switch does.
     let isTabVisible: Bool
 
-    @StateObject private var controller = VirtualCameraPreviewController()
+    @StateObject private var controller: VirtualCameraPreviewController
+
+    /// Hands the activator to the controller at construction rather
+    /// than wiring it up in `onAppear`, so the controller is never
+    /// briefly sampling without its host-side signal. The
+    /// `StateObject` autoclosure runs once for the view's lifetime and
+    /// keeps the first activator it's given — safe here because
+    /// `AppDelegate` owns exactly one for the life of the process.
+    init(activator: VirtualCameraActivator, isTabVisible: Bool) {
+        self.activator = activator
+        self.isTabVisible = isTabVisible
+        _controller = StateObject(
+            wrappedValue: VirtualCameraPreviewController(activator: activator)
+        )
+    }
 
     private var shouldRun: Bool {
         isTabVisible && activator.state == .on
@@ -162,11 +273,24 @@ struct VirtualCameraPreviewCard: View {
 ///
 /// Deliberately a plain consumer: it finds the virtual camera by the
 /// UID the extension publishes and opens it with an
-/// `AVCaptureDeviceInput`, exactly like any video app. It never reads
-/// the activator's pipeline internals, so "the preview works" and
-/// "another app will work" are the same statement.
+/// `AVCaptureDeviceInput`, exactly like any video app. Everything the
+/// *picture* proves, it proves the same way another app would, so "the
+/// preview works" and "another app will work" stay the same statement.
+///
+/// The one exception is `VirtualCameraActivator
+/// .hostDeliveredFrameCount`, sampled alongside the frame count. A
+/// video app can't read it and doesn't need to — it just shows
+/// whatever arrives — but this row claims to say *why* the picture
+/// looks the way it does, and the extension's placeholder is
+/// indistinguishable from live video on the wire. See
+/// `VirtualCameraPreviewStatus`.
 final class VirtualCameraPreviewController: NSObject, ObservableObject {
     @Published private(set) var status: VirtualCameraPreviewStatus = .idle
+
+    /// Source of the host-side delivery count. Strong: the activator
+    /// outlives every preview and holds nothing back, so there's no
+    /// cycle to break.
+    private let activator: VirtualCameraActivator
 
     /// Handed to the preview layer. One session for the controller's
     /// lifetime so the layer's binding stays stable across
@@ -176,8 +300,10 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
 
     /// Status sampling cadence. Also the fps averaging window — long
     /// enough to be steady, short enough that a stall shows up while
-    /// the user is still looking at the tab.
-    private static let sampleInterval: TimeInterval = 1.0
+    /// the user is still looking at the tab. Not private because
+    /// `VirtualCameraPreviewStatus.hostDeliveryGraceSeconds` is
+    /// defined in terms of it.
+    static let sampleInterval: TimeInterval = 1.0
 
     private let sampleQueue = DispatchQueue(
         label: "com.ericwillis.avpainreliever.preview.samples",
@@ -205,12 +331,39 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
     private var everDelivered = false
     private var lastSampleAt: TimeInterval = 0
 
+    /// Host-side delivery count as of the last tick that saw it move,
+    /// and when that was. Compared for *change* rather than growth:
+    /// tearing the capture pipeline down and building it back up hands
+    /// out a fresh `CMIOSinkWriter` whose count restarts at zero, and
+    /// that restart is still evidence the host is alive. Main-thread
+    /// only, like the tick that maintains them.
+    private var lastHostDeliveryCount: UInt64 = 0
+    private var lastHostDeliveryMovedAt: TimeInterval = 0
+
+    /// Whether the host has put at least one frame into the sink in
+    /// this sampling session — `hostDeliveredFrameCount` moving, or
+    /// already nonzero when the session started. Reset by
+    /// `beginSession()`; latched `true` by `sample()` the moment the
+    /// count first moves. Gates `hostDeliveryGraceSeconds` in
+    /// `.derive`: a host that has never delivered gets no grace,
+    /// because grace is forgiveness for a host that proved it was
+    /// alive and then paused, and this one hasn't proved anything yet.
+    /// Without this, `startSampling()` seeding `lastHostDeliveryMovedAt`
+    /// to "now" made a host that will never deliver look exactly like
+    /// one that just delivered — the #125 masking bug this replaces.
+    private var hostEverDelivered = false
+
     /// Frames counted since the last sampling tick. Written on
     /// `sampleQueue` by the sample-buffer delegate, read on the main
     /// thread by the tick, hence the lock rather than queue
     /// confinement.
     private let frameCountLock = NSLock()
     private var framesSinceSample = 0
+
+    init(activator: VirtualCameraActivator) {
+        self.activator = activator
+        super.init()
+    }
 
     /// Idempotent start/stop entry point. Every lifecycle signal the
     /// view has (appear, disappear, tab switch, extension state
@@ -251,6 +404,7 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
         guard !isRunning else { return }
         isRunning = true
         everDelivered = false
+        hostEverDelivered = false
         setStatus(.waitingForFrames)
         configureIfPossible()
         startSampling()
@@ -342,6 +496,7 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
         sampleTimer?.cancel()
         sampleTimer = nil
         everDelivered = false
+        hostEverDelivered = false
 
         // Input and output are installed together or not at all;
         // nothing to release if `configureIfPossible` never found the
@@ -376,6 +531,19 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
 
     private func startSampling() {
         lastSampleAt = ProcessInfo.processInfo.systemUptime
+        // Seed the host-delivery baseline at the same instant. This
+        // only feeds the grace window's dryness clock — it does not by
+        // itself claim the host has ever delivered. A nonzero count
+        // here means a pipeline that was already live before this
+        // preview session opened (the activator's count is
+        // process-lifetime, not session-lifetime), which is real
+        // evidence, so `hostEverDelivered` starts `true`. A zero count
+        // is the opposite: no evidence at all yet, so it starts
+        // `false` and `.derive` gives it no grace — `sample()` flips it
+        // the moment the count actually moves.
+        lastHostDeliveryCount = activator.hostDeliveredFrameCount
+        lastHostDeliveryMovedAt = lastSampleAt
+        hostEverDelivered = lastHostDeliveryCount != 0
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(
             deadline: .now() + Self.sampleInterval,
@@ -400,17 +568,28 @@ final class VirtualCameraPreviewController: NSObject, ObservableObject {
         lastSampleAt = now
         let frames = takeFrameCount()
 
+        let hostCount = activator.hostDeliveredFrameCount
+        if hostCount != lastHostDeliveryCount {
+            lastHostDeliveryCount = hostCount
+            lastHostDeliveryMovedAt = now
+            hostEverDelivered = true
+        }
+
         // No installed device → `configureIfPossible` owns the status
         // (`.deviceMissing`), and any frames counted are leftovers from
         // the run that just ended rather than evidence of a live feed.
         guard input != nil else { return }
 
-        if frames > 0 {
-            everDelivered = true
-            setStatus(.streaming(fps: max(1, Int((Double(frames) / elapsed).rounded()))))
-        } else {
-            setStatus(everDelivered ? .stalled : .waitingForFrames)
-        }
+        if frames > 0 { everDelivered = true }
+        setStatus(
+            .derive(
+                sourceFrames: frames,
+                windowSeconds: elapsed,
+                everDelivered: everDelivered,
+                hostEverDelivered: hostEverDelivered,
+                hostDrySeconds: now - lastHostDeliveryMovedAt
+            )
+        )
     }
 
     /// Equality-guarded so an unchanged status doesn't fire

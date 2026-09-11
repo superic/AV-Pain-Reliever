@@ -135,8 +135,32 @@ public final class CMIOSinkWriter {
         lastLoggedInputSignature = nil
     }
 
+    /// Guards `enqueueCount` alone. `enqueue` writes it from the
+    /// capture delegate queue; `deliveredFrameCount` is read from the
+    /// main thread. Nothing else in this class is touched from two
+    /// threads, so the lock stays scoped to the counter rather than
+    /// wrapping the writer.
+    private let enqueueCountLock = NSLock()
     private var enqueueCount: UInt64 = 0
+    /// Only ever touched on the capture delegate queue.
     private var enqueueRejectCount: UInt64 = 0
+
+    /// Frames the host has successfully handed to the extension's sink
+    /// queue since this writer started. Monotonic for the writer's
+    /// lifetime; a new writer starts back at zero.
+    ///
+    /// This is the host's own ground truth for "the real camera is
+    /// delivering right now", and the only way to know it. The source
+    /// stream carries placeholder frames and live frames alike once the
+    /// sink goes dry past `NoSignalPolicy.holdWindowNs`, so a consumer
+    /// counting arrivals on the source — the Settings preview, or any
+    /// video app — cannot tell the two apart. Callers sample this and
+    /// watch for movement; they never get the pixels.
+    public var deliveredFrameCount: UInt64 {
+        enqueueCountLock.lock()
+        defer { enqueueCountLock.unlock() }
+        return enqueueCount
+    }
 
     /// Wraps an incoming pixel buffer in a CMSampleBuffer and
     /// enqueues it. Caller owns the pixel buffer; this method does
@@ -144,7 +168,7 @@ public final class CMIOSinkWriter {
     /// retains internally.
     func enqueue(pixelBuffer: CVPixelBuffer, hostTimeNs: UInt64) {
         guard let queue else {
-            if enqueueCount == 0 {
+            if deliveredFrameCount == 0 {
                 logger.error("enqueue called before queue ready — dropping")
             }
             return
@@ -194,16 +218,19 @@ public final class CMIOSinkWriter {
             enqueueRejectCount += 1
             if enqueueRejectCount % Self.enqueueRejectStride == 1 {
                 logger.error(
-                    "CMSimpleQueueEnqueue rejected (rejects=\(self.enqueueRejectCount)/\(self.enqueueCount), status=\(enqueueStatus))"
+                    "CMSimpleQueueEnqueue rejected (rejects=\(self.enqueueRejectCount)/\(self.deliveredFrameCount), status=\(enqueueStatus))"
                 )
             }
             return
         }
 
+        enqueueCountLock.lock()
         enqueueCount += 1
-        if enqueueCount == 1 || enqueueCount % Self.enqueueHeartbeatStride == 0 {
+        let delivered = enqueueCount
+        enqueueCountLock.unlock()
+        if delivered == 1 || delivered % Self.enqueueHeartbeatStride == 0 {
             logger.info(
-                "Enqueued frame #\(self.enqueueCount) (rejects=\(self.enqueueRejectCount))"
+                "Enqueued frame #\(delivered) (rejects=\(self.enqueueRejectCount))"
             )
         }
     }

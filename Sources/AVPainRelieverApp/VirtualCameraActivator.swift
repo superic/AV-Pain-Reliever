@@ -198,6 +198,20 @@ final class VirtualCameraActivator: NSObject, ObservableObject,
     private var sinkWriter: CMIOSinkWriter?
     private var captureSession: CameraCaptureSession?
 
+    /// Frames the host-side pipeline has handed to the extension's
+    /// sink, or 0 while no pipeline is running.
+    ///
+    /// Exists for the Settings preview, which counts frames on the
+    /// *source* stream and so can't tell a live picture from the
+    /// extension's no-signal placeholder. Movement here is the host's
+    /// own proof that the real camera is delivering. Not monotonic
+    /// across a pipeline teardown — a rebuilt `CMIOSinkWriter` starts
+    /// at zero — so callers must read "changed since last sample",
+    /// not "went up". Main-thread only, like the pipeline it reads.
+    var hostDeliveredFrameCount: UInt64 {
+        sinkWriter?.deliveredFrameCount ?? 0
+    }
+
     /// Most recent source-camera name a profile asked us to route.
     /// Held across the "no consumer yet" window so that when lazy
     /// capture finally spins up (consumer connects after a profile

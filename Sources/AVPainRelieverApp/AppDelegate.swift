@@ -282,6 +282,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var pendingForceApplyName: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Seed the Camera Extension's copy of the no-signal
+        // placeholder setting. The extension is a separate
+        // process and can't read our defaults; without this a
+        // host that never touches the picker leaves it reading
+        // a stale container.
+        settings.publishNoSignalModeToExtension()
+
         // Hide the Dock icon programmatically. The eventual signed
         // .app bundle will set LSUIElement = YES in Info.plist, which
         // is the same effect at launch time. For an SPM-built binary
