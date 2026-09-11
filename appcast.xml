@@ -786,5 +786,21 @@
                        type="application/octet-stream"
                        sparkle:edSignature="UrAcjudP0DAvLs9a6PSgcLFIiU+e6XdpiR9QzjdJYITDUsFpsxCG6MaJImW//H7flSXZOyA9yYjWzwSmCbGaBw==" length="3381334" />
         </item>
+        <item>
+            <title>Version 0.2.0.22</title>
+            <description><![CDATA[
+<h2>What's new</h2>
+<p>Here's a question that used to cost an hour of log-reading: is the virtual camera actually streaming right now? v0.2.0.22 answers it at a glance. Open <strong>Settings → Camera</strong> and there's a live preview of the virtual camera's own output — not a peek at the internals, a real connection through the same door Zoom walks through. If the preview shows a picture, Zoom gets a picture. Same sentence, every time. Underneath it, a status row in plain English: relaying 30 fps from whatever camera your profile named, or source connected and no frames arriving, or the extension hasn't shown up yet. No guessing.</p>
+<p>That preview now spans the full width of the card at a clean 16:9. The first cut floated a little postage stamp in the middle with dead gutters on both sides, which read like an accident instead of a design. Picture's about 75% bigger now, which is the whole point — you're making a frozen-versus-live call, you want to actually see it. Settings window grew to fit.</p>
+<p>And the self-heal grew teeth. There's a state where macOS holds the camera in a stale spot and the app genuinely cannot see it, no matter how politely it keeps asking — the only cure is a fresh process. So now the app does that itself: tells you what's happening, restarts, comes back working. One restart. Exactly one, latched across the restart so it can never spiral into a loop. If the fresh process still can't find the camera, it stops trying and hands you the manual button with copy that actually explains the situation. Money.</p>
+]]></description>
+            <pubDate>Fri, 11 Sep 2026 16:58:47 +0000</pubDate>
+            <sparkle:version>0.2.0.22</sparkle:version>
+            <sparkle:shortVersionString>0.2.0.22</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/superic/av-pain-reliever/releases/download/v0.2.0.22/AVPainReliever.app.zip"
+                       type="application/octet-stream"
+                       sparkle:edSignature="OoWNvyIGzadfg6z8qUap8WlCaKO6/XuWHdyLob0nCA70m2jpd+xVl1570EAeAnzI0tAHCyN6X3abn4JBaeo1CQ==" length="3381295" />
+        </item>
     </channel>
 </rss>
