@@ -55,7 +55,6 @@ on once and leave it. Not a deal-breaker.
 That's the update. Virtual camera, profile-driven, hold-last-frame,
 universal format support. v0.1.x will keep getting patch releases
 in parallel for anyone who doesn't need any of this. **Money.**
-```
 
 ### Preview card goes full width (2026-08-30)
 
