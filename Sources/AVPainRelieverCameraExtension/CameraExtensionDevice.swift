@@ -2,12 +2,22 @@ import Foundation
 import CoreMediaIO
 import CoreMedia
 import IOKit.audio
+import AVPainRelieverSharedConstants
 import os.log
 
 private let logger = Logger(
     subsystem: "com.ericwillis.avpainreliever.CameraExtension",
     category: "Device"
 )
+
+/// A pixel buffer and the `CMFormatDescription` derived from *that*
+/// buffer. The two always travel together because the strict
+/// `CMSampleBufferCreateForImageBuffer` validator rejects a description
+/// minted from a different buffer with -12743, even when dimensions and
+/// pixel format match. Whatever the source stream sends — a frame
+/// consumed from the sink, or a placeholder from `NoSignalFrameSource`
+/// — arrives as one of these.
+typealias SourceFrame = (image: CVPixelBuffer, format: CMFormatDescription)
 
 /// The single virtual camera device registered by this extension.
 /// Owns two streams:
@@ -23,13 +33,39 @@ private let logger = Logger(
 /// passes IOSurfaces between host and extension processes
 /// transparently — no explicit XPC.
 ///
-/// That loop is a timer, and it runs for as long as the host holds
-/// the sink open — which some clients (Zoom) do for their entire
-/// process lifetime, call or no call. So the pump has two cadences:
-/// the full 90 Hz drain whenever anything is happening, and a slow
-/// idle tick once the source has no clients *and* the sink has been
-/// dry for a few seconds. It jumps back to full rate the instant a
-/// frame arrives or an AVCapture client attaches.
+/// That loop is a timer, and it runs whenever there is *either* a
+/// host writing to the sink or an AVCapture client reading the
+/// source — the two are independent, and the pump has work to do
+/// under either one alone. With a sink attached each tick drains it;
+/// without one, each tick goes straight to the dry path, which is
+/// what keeps a placeholder flowing to a client whose host has torn
+/// its capture pipeline down. With neither, the timer is cancelled
+/// outright.
+///
+/// Some clients (Zoom) hold the sink open for their entire process
+/// lifetime, call or no call, so the pump also has two cadences: the
+/// full 90 Hz drain whenever anything is happening, and a slow idle
+/// tick once the source has no clients *and* the sink has been dry
+/// for a few seconds. It jumps back to full rate the instant a frame
+/// arrives or an AVCapture client attaches.
+///
+/// On a tick where the sink yields nothing, what the source emits is
+/// `NoSignalPolicy`'s call: the cached frame while the dry spell is
+/// still inside `holdWindowNs`, the configured `NoSignalMode`
+/// placeholder once it isn't (or when there is no cached frame at
+/// all), and nothing whatsoever when no client is watching. Either
+/// way the send is spaced to the declared 30 fps, so one tick in
+/// three actually emits.
+///
+/// **Threading.** `consumeQueue` owns every mutable field below, and
+/// is the only place frames are emitted or `noSignalFrames` is
+/// touched. CMIO delivers the `consumeSampleBuffer` completion on a
+/// queue of its own, so that completion's first act is to hop back
+/// here; everything arriving from a Darwin notification or from a
+/// stream callback hops the same way. Nothing is read or written
+/// across threads, which is why none of this needs a lock — and the
+/// client counts the pump reads are mirrored into `hasSourceWatchers`
+/// on those hops rather than reached for on the stream object.
 ///
 /// Identifier and name are stable so reinstalls don't churn the
 /// device registry — apps that remember "AV Pain Reliever" by
@@ -62,9 +98,19 @@ final class CameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSource {
     private var consumeTimer: DispatchSourceTimer?
 
     /// Whether `consumeTimer` is currently on the idle schedule.
-    /// Mutated only on `consumeQueue`; read from the consume
-    /// completion as a cheap "do I need to hop?" hint.
     private var pumpIsIdle = false
+
+    /// The host client currently writing to the sink, or nil when no
+    /// host is. Doubles as the pump's "is there a sink to drain?"
+    /// flag: a tick with no client goes straight to the dry path.
+    private var sinkClient: CMIOExtensionClient?
+
+    /// Whether an AVCapture client is reading the source stream.
+    /// Mirrors `CameraExtensionStreamSource.streamingCounter`'s 0↔1
+    /// edges onto `consumeQueue` (see `sourceClientBecameActive` /
+    /// `sourceClientBecameInactive`) so the pump reads a field it owns
+    /// rather than a counter another thread is mutating.
+    private var hasSourceWatchers = false
 
     init(localizedName: String) {
         super.init()
@@ -99,6 +145,47 @@ final class CameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSource {
         } catch {
             fatalError("addStream failed: \(error)")
         }
+
+        registerNoSignalModeListener()
+    }
+
+    deinit {
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterRemoveEveryObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            observer
+        )
+    }
+
+    /// The host writes the picked mode into the shared App Group
+    /// container and posts a payload-free Darwin notification; we
+    /// re-read the key. Same shape as
+    /// `CameraExtensionStreamSource.registerQueryListener()`.
+    private func registerNoSignalModeListener() {
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            observer,
+            { _, observer, _, _, _ in
+                guard let observer else { return }
+                let me = Unmanaged<CameraExtensionDeviceSource>
+                    .fromOpaque(observer)
+                    .takeUnretainedValue()
+                me.reloadNoSignalMode()
+            },
+            CameraExtensionNotifications.noSignalModeChanged as CFString,
+            nil,
+            .deliverImmediately
+        )
+    }
+
+    /// Hops to `consumeQueue` because `noSignalFrames` is owned by the
+    /// consume path — the notification lands on some other thread.
+    private func reloadNoSignalMode() {
+        let mode = NoSignalSharedStore.readMode()
+        consumeQueue.async { [weak self] in
+            self?.noSignalFrames.setMode(mode)
+        }
     }
 
     var availableProperties: Set<CMIOExtensionProperty> {
@@ -126,21 +213,35 @@ final class CameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSource {
     // MARK: - Sink → source pipeline
 
     /// Called by `CameraExtensionStreamSink.startStream` when the
-    /// host starts pushing frames to the sink. Begins the consume
-    /// timer that drains the sink and forwards to the source.
+    /// host starts pushing frames to the sink. Adopts the client and
+    /// makes sure the pump is running at full rate, so the ticks that
+    /// were emitting placeholders (or weren't running at all) start
+    /// draining the sink instead.
     func sinkStartedStreaming(client: CMIOExtensionClient) {
         logger.info("sinkStartedStreaming")
         consumeQueue.async { [weak self] in
             guard let self else { return }
-            self.startConsumeTimer(client: client)
+            self.sinkClient = client
+            self.startPump()
         }
     }
 
+    /// The host has torn its capture pipeline down. That is *not* the
+    /// end of the pump: an AVCapture client can still be holding the
+    /// source open, and leaving it with the last real frame of the
+    /// user frozen on screen is the exact failure the placeholder
+    /// exists to prevent. So the cached frame goes, the sink client
+    /// goes, and the tick keeps running on dry ticks alone until the
+    /// last watcher leaves too.
     func sinkStoppedStreaming() {
         logger.info("sinkStoppedStreaming")
         consumeQueue.async { [weak self] in
-            self?.consumeTimer?.cancel()
-            self?.consumeTimer = nil
+            guard let self else { return }
+            self.sinkClient = nil
+            // Whatever the host last sent is now an image of a session
+            // that's over. See `heldFrame`.
+            self.heldFrame = nil
+            self.stopPumpIfUnused()
         }
     }
 
@@ -169,27 +270,58 @@ final class CameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSource {
 
     /// Whether the pump can drop to the idle cadence. Deliberately
     /// conservative: a watching client keeps the full-rate schedule
-    /// no matter how dry the sink is, because the hold-last-frame
-    /// re-emits it depends on ride on these same ticks.
+    /// no matter how dry the sink is, because the dry-tick emits it
+    /// depends on — held frame or placeholder — ride on these same
+    /// ticks. With no client there is nothing to emit either way, so
+    /// the placeholder never holds the pump up.
     private static func shouldRunIdle(
-        sourceClients: UInt32,
+        hasWatchers: Bool,
         consecutiveEmptyConsumes: UInt64
     ) -> Bool {
-        sourceClients == 0
+        !hasWatchers
             && consecutiveEmptyConsumes >= idleDownshiftAfterEmpties
     }
 
-    private func startConsumeTimer(client: CMIOExtensionClient) {
-        consumeTimer?.cancel()
+    /// Get the pump running at the active cadence, starting the timer
+    /// if it isn't already. Must be called on `consumeQueue`.
+    ///
+    /// The tick reads `sinkClient` rather than closing over one, so a
+    /// pump started by a watching client keeps running unchanged when
+    /// a host later attaches to the sink, and vice versa.
+    private func startPump() {
+        guard consumeTimer == nil else {
+            setPumpIdle(false)
+            return
+        }
         let timer = DispatchSource.makeTimerSource(queue: consumeQueue)
         pumpIsIdle = false
         consecutiveEmptyConsumes = 0
         schedule(timer, idle: false)
         timer.setEventHandler { [weak self] in
-            self?.consumeOne(client: client)
+            self?.tick()
         }
         consumeTimer = timer
         timer.resume()
+    }
+
+    /// Stop the pump once nothing is left for it to do — no host
+    /// writing to the sink and nobody reading the source. Must be
+    /// called on `consumeQueue`.
+    private func stopPumpIfUnused() {
+        guard sinkClient == nil, !hasSourceWatchers else { return }
+        consumeTimer?.cancel()
+        consumeTimer = nil
+    }
+
+    /// One pump tick. Drains the sink when a host is writing to it;
+    /// otherwise there is nothing to drain and the dry path — hold or
+    /// placeholder — runs directly.
+    private func tick() {
+        if let sinkClient {
+            consumeOne(client: sinkClient)
+        } else {
+            dryTick(nowNs: Self.hostTimeNs())
+        }
     }
 
     private func schedule(_ timer: DispatchSourceTimer, idle: Bool) {
@@ -214,11 +346,48 @@ final class CameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSource {
     }
 
     /// Called by `CameraExtensionStreamSource.startStream` on the 0→1
-    /// client edge. Someone is about to watch, so the pump needs to
-    /// be back at full rate before the first frame is expected.
+    /// client edge. Someone is about to watch, so the pump needs to be
+    /// running and at full rate before the first frame is expected —
+    /// including when no host is writing to the sink at all, in which
+    /// case these ticks are the only thing standing between the client
+    /// and a black hole.
+    ///
+    /// It's also where the held frame dies. A client that just
+    /// attached must never be shown a frame that was cached before it
+    /// attached: the extension process outlives any one call, so
+    /// without this, the first seconds of a new call can broadcast an
+    /// image captured in an earlier one.
+    ///
+    /// That only applies to a frame nobody is refreshing, though. When
+    /// the sink is still delivering — a second client attaching to a
+    /// live stream, say, or the Settings preview reopening inside the
+    /// host's stop grace — the cache is a few milliseconds old and
+    /// about to be overwritten by the next live frame anyway, and
+    /// dropping it opens a window where a dry tick landing between two
+    /// live frames would punch a single placeholder frame into
+    /// otherwise-live video. So the cache survives exactly as long as
+    /// the sink is demonstrably still feeding it.
     func sourceClientBecameActive() {
         consumeQueue.async { [weak self] in
-            self?.setPumpIdle(false)
+            guard let self else { return }
+            self.hasSourceWatchers = true
+            self.startPump()
+            let sinkIsDelivering = self.sinkClient != nil
+                && Self.hostTimeNs() - self.lastLiveFrameHostTimeNs
+                    < Self.liveSinkGraceNs
+            if !sinkIsDelivering { self.heldFrame = nil }
+        }
+    }
+
+    /// Called by `CameraExtensionStreamSource.stopStream` on the 1→0
+    /// client edge. With nobody watching there is nothing to emit, so
+    /// the pump can stop entirely unless the host is still writing to
+    /// the sink.
+    func sourceClientBecameInactive() {
+        consumeQueue.async { [weak self] in
+            guard let self else { return }
+            self.hasSourceWatchers = false
+            self.stopPumpIfUnused()
         }
     }
 
@@ -227,144 +396,225 @@ final class CameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSource {
     private var emptyConsumeCount: UInt64 = 0
     private var consecutiveEmptyConsumes: UInt64 = 0
     private var heldFrameCount: UInt64 = 0
+    private var placeholderFrameCount: UInt64 = 0
 
-    /// Most recent sample buffer received from the host. Re-emitted
-    /// when the sink yields nothing — keeps the source flowing during
-    /// the ~500 ms input-swap window inside `CameraCaptureSession`.
-    /// Without this, AVCapture clients (Zoom) see the call freeze or
-    /// drop while the new camera warms up.
-    private var lastFrameImage: CVPixelBuffer?
-    private var lastFrameFormat: CMFormatDescription?
+    /// Image + format of the most recent frame received from the host,
+    /// cached together because they're only ever used together.
+    /// Re-emitted when the sink yields nothing, which keeps the source
+    /// flowing during the ~500 ms input-swap window inside
+    /// `CameraCaptureSession` — without it, AVCapture clients (Zoom)
+    /// see the call freeze or drop while the new camera warms up.
+    ///
+    /// Bounded in two directions, because an unbounded hold broadcasts
+    /// a stale picture of the user: `NoSignalPolicy.holdWindowNs` caps
+    /// how long a dry spell keeps re-emitting it, and it is dropped
+    /// outright when the sink stops (see `sinkStoppedStreaming`) and
+    /// when a consumer attaches to a sink that isn't currently
+    /// delivering (see `sourceClientBecameActive`).
+    private var heldFrame: SourceFrame?
+
+    /// Host time of the most recent *live* frame consumed from the
+    /// sink. Distinct from `lastSourceSendHostTimeNs`, which also
+    /// advances on held and placeholder sends: the dry duration has to
+    /// measure the silence from the host, and anything we emit
+    /// ourselves must not reset it.
+    private var lastLiveFrameHostTimeNs: UInt64 = 0
 
     /// Host time of the most recent frame we sent through the source
-    /// stream — whether a fresh sink frame or a held repeat. Used to
-    /// rate-limit hold-last-frame emissions to roughly the source's
-    /// declared frame duration.
+    /// stream — fresh, held or placeholder. Used to rate-limit dry-tick
+    /// emissions to roughly the source's declared frame duration.
     private var lastSourceSendHostTimeNs: UInt64 = 0
 
-    /// Minimum spacing between hold-last-frame emissions. Matches the
+    /// Minimum spacing between dry-tick emissions. Matches the
     /// source's declared 30 fps so AVCapture clients see a steady
     /// cadence rather than a 90 Hz burst (the consume timer ticks at
     /// 3× framerate, but only one in three should re-emit).
     private static let heldFrameMinSpacingNs: UInt64 =
         UInt64(1_000_000_000.0 / 30.0)
 
+    /// How recently a live frame must have arrived for the sink to
+    /// count as still delivering when a consumer attaches. Two frame
+    /// intervals — long enough to ride out ordinary 30 fps jitter,
+    /// far short of any gap that could span two sessions. See
+    /// `sourceClientBecameActive`.
+    private static let liveSinkGraceNs: UInt64 = heldFrameMinSpacingNs * 2
+
+    /// Placeholder pixels. Seeded from the shared container at startup
+    /// and re-read on the host's Darwin notification; touched only on
+    /// `consumeQueue`.
+    private let noSignalFrames = NoSignalFrameSource(
+        mode: NoSignalSharedStore.readMode()
+    )
+
+    private static func hostTimeNs() -> UInt64 {
+        UInt64(
+            CMClockGetTime(CMClockGetHostTimeClock()).seconds
+                * Double(NSEC_PER_SEC)
+        )
+    }
+
     private func consumeOne(client: CMIOExtensionClient) {
         streamSink.stream.consumeSampleBuffer(from: client) {
             [weak self] sampleBuffer, sequenceNumber, _, _, error in
             guard let self else { return }
-            if let error {
-                logger.error("consume error: \(error.localizedDescription, privacy: .public)")
-                return
-            }
-            let nowNs = UInt64(
-                CMClockGetTime(CMClockGetHostTimeClock()).seconds
-                    * Double(NSEC_PER_SEC)
-            )
-
-            guard let sampleBuffer else {
-                self.emptyConsumeCount += 1
-                self.consecutiveEmptyConsumes += 1
-                if self.emptyConsumeCount % 90 == 1 {
-                    logger.debug(
-                        "consume returned no buffer (\(self.emptyConsumeCount, privacy: .public) empty so far)"
-                    )
-                }
-                self.maybeEmitHeldFrame(nowNs: nowNs)
-                if !self.pumpIsIdle,
-                   Self.shouldRunIdle(
-                       sourceClients: self.streamSource.streamingCounter,
-                       consecutiveEmptyConsumes: self.consecutiveEmptyConsumes
-                   )
-                {
-                    self.consumeQueue.async { self.setPumpIdle(true) }
-                }
-                return
-            }
-
-            self.consecutiveEmptyConsumes = 0
-            if self.pumpIsIdle {
-                self.consumeQueue.async { self.setPumpIdle(false) }
-            }
-            self.consumedCount += 1
-            if self.consumedCount == 1 || self.consumedCount % 60 == 0 {
-                logger.info(
-                    "Consumed frame #\(self.consumedCount, privacy: .public), source streamingCounter=\(self.streamSource.streamingCounter, privacy: .public)"
-                )
-            }
-
-            // Tell the sink the frame moved through, so its
-            // `streamSinkEndOfData` and underrun counters stay
-            // sane.
-            let scheduled = CMIOExtensionScheduledOutput(
-                sequenceNumber: sequenceNumber,
-                hostTimeInNanoseconds: nowNs
-            )
-            self.streamSink.stream.notifyScheduledOutputChanged(scheduled)
-
-            // Cache the underlying image + format so we can re-emit
-            // it during a source swap when the sink temporarily
-            // dries up. Holding the CVPixelBuffer (not the parent
-            // CMSampleBuffer) lets us mint fresh sample buffers
-            // with current timestamps for each repeat.
-            if let image = CMSampleBufferGetImageBuffer(sampleBuffer),
-               let format = CMSampleBufferGetFormatDescription(sampleBuffer)
-            {
-                self.lastFrameImage = image
-                self.lastFrameFormat = format
-            }
-
-            // Drop the frame on the floor if no AVCapture client is
-            // currently watching the source. Saves the cost of
-            // a `stream.send` that nobody would consume anyway.
-            guard self.streamSource.streamingCounter > 0 else { return }
-
-            let pts = sampleBuffer.presentationTimeStamp
-            let ptsNs = UInt64(pts.seconds * Double(NSEC_PER_SEC))
-            self.streamSource.stream.send(
-                sampleBuffer,
-                discontinuity: [],
-                hostTimeInNanoseconds: ptsNs
-            )
-            self.lastSourceSendHostTimeNs = nowNs
-            self.forwardedCount += 1
-            if self.forwardedCount == 1 || self.forwardedCount % 60 == 0 {
-                logger.info(
-                    "Forwarded frame #\(self.forwardedCount, privacy: .public) to source"
+            // CMIO calls this back on a queue of its own. Every field
+            // the handler touches belongs to `consumeQueue`, so hop
+            // before touching any of it.
+            self.consumeQueue.async {
+                self.handleConsumed(
+                    sampleBuffer,
+                    sequenceNumber: sequenceNumber,
+                    error: error
                 )
             }
         }
     }
 
-    /// Re-emit the cached frame on a sink-empty tick when (a) someone
-    /// is watching, (b) we have a frame to repeat, and (c) we haven't
-    /// already sent one recently. The "recent" gate keeps the source's
-    /// effective FPS pinned to ~30 even though the consume timer
-    /// fires at 90 Hz.
-    private func maybeEmitHeldFrame(nowNs: UInt64) {
-        guard streamSource.streamingCounter > 0,
-              let image = lastFrameImage,
-              let format = lastFrameFormat
-        else { return }
-        if nowNs - lastSourceSendHostTimeNs < Self.heldFrameMinSpacingNs {
+    /// Everything a consume yields, handled on `consumeQueue`.
+    private func handleConsumed(
+        _ sampleBuffer: CMSampleBuffer?,
+        sequenceNumber: UInt64,
+        error: Error?
+    ) {
+        if let error {
+            logger.error("consume error: \(error.localizedDescription, privacy: .public)")
             return
         }
-        guard let repeated = makeSampleBuffer(
-            image: image,
-            format: format,
-            hostTimeNs: nowNs
-        ) else { return }
+        let nowNs = Self.hostTimeNs()
+
+        guard let sampleBuffer else {
+            emptyConsumeCount += 1
+            if emptyConsumeCount % 90 == 1 {
+                logger.debug(
+                    "consume returned no buffer (\(self.emptyConsumeCount, privacy: .public) empty so far)"
+                )
+            }
+            dryTick(nowNs: nowNs)
+            return
+        }
+
+        consecutiveEmptyConsumes = 0
+        setPumpIdle(false)
+        consumedCount += 1
+        if consumedCount == 1 || consumedCount % 60 == 0 {
+            logger.info(
+                "Consumed frame #\(self.consumedCount, privacy: .public), watched=\(self.hasSourceWatchers, privacy: .public)"
+            )
+        }
+
+        // Tell the sink the frame moved through, so its
+        // `streamSinkEndOfData` and underrun counters stay sane.
+        let scheduled = CMIOExtensionScheduledOutput(
+            sequenceNumber: sequenceNumber,
+            hostTimeInNanoseconds: nowNs
+        )
+        streamSink.stream.notifyScheduledOutputChanged(scheduled)
+
+        // Cache the underlying image + format so we can re-emit it
+        // during a source swap when the sink temporarily dries up.
+        // Holding the CVPixelBuffer (not the parent CMSampleBuffer)
+        // lets us mint fresh sample buffers with current timestamps
+        // for each repeat.
+        if let image = CMSampleBufferGetImageBuffer(sampleBuffer),
+           let format = CMSampleBufferGetFormatDescription(sampleBuffer)
+        {
+            heldFrame = (image, format)
+            lastLiveFrameHostTimeNs = nowNs
+        }
+
+        // Drop the frame on the floor if no AVCapture client is
+        // currently watching the source. Saves the cost of a
+        // `stream.send` that nobody would consume anyway.
+        guard hasSourceWatchers else { return }
+
+        let ptsNs = UInt64(
+            sampleBuffer.presentationTimeStamp.seconds * Double(NSEC_PER_SEC)
+        )
+        streamSource.stream.send(
+            sampleBuffer,
+            discontinuity: [],
+            hostTimeInNanoseconds: ptsNs
+        )
+        lastSourceSendHostTimeNs = nowNs
+        forwardedCount += 1
+        if forwardedCount == 1 || forwardedCount % 60 == 0 {
+            logger.info(
+                "Forwarded frame #\(self.forwardedCount, privacy: .public) to source"
+            )
+        }
+    }
+
+    /// A tick that produced no live frame — either the consume came
+    /// back empty or there is no sink to consume from at all. Emits
+    /// whatever `NoSignalPolicy` calls for and downshifts the cadence
+    /// once the dry run is long enough and nobody is watching. Must be
+    /// called on `consumeQueue`.
+    private func dryTick(nowNs: UInt64) {
+        consecutiveEmptyConsumes += 1
+        maybeEmitDryTickFrame(nowNs: nowNs)
+        if Self.shouldRunIdle(
+            hasWatchers: hasSourceWatchers,
+            consecutiveEmptyConsumes: consecutiveEmptyConsumes
+        ) {
+            setPumpIdle(true)
+        }
+    }
+
+    /// Decide and send this dry tick's frame.
+    ///
+    /// The spacing gate governs *when* — it keeps the source's
+    /// effective FPS pinned to ~30 even though the pump ticks at
+    /// 90 Hz — and `NoSignalPolicy` governs *what*, so the held
+    /// frame / placeholder / nothing matrix lives in one testable
+    /// place shared with the host rather than in the pump.
+    private func maybeEmitDryTickFrame(nowNs: UInt64) {
+        guard nowNs - lastSourceSendHostTimeNs >= Self.heldFrameMinSpacingNs
+        else { return }
+
+        let decision = NoSignalPolicy.decide(
+            hasWatchers: hasSourceWatchers,
+            hasHeldFrame: heldFrame != nil,
+            dryDurationNs: nowNs - lastLiveFrameHostTimeNs
+        )
+        let frame: SourceFrame?
+        switch decision {
+        case .idle:
+            frame = nil
+        case .holdLastFrame:
+            frame = heldFrame
+        case .placeholder:
+            frame = noSignalFrames.nextFrame()
+        }
+
+        guard
+            let frame,
+            let repeated = makeSampleBuffer(
+                image: frame.image,
+                format: frame.format,
+                hostTimeNs: nowNs
+            )
+        else { return }
         streamSource.stream.send(
             repeated,
             discontinuity: [],
             hostTimeInNanoseconds: nowNs
         )
         lastSourceSendHostTimeNs = nowNs
-        heldFrameCount += 1
-        if heldFrameCount == 1 || heldFrameCount % 30 == 0 {
-            logger.info(
-                "Held-last-frame emit #\(self.heldFrameCount, privacy: .public)"
-            )
+
+        if decision == .holdLastFrame {
+            heldFrameCount += 1
+            if heldFrameCount == 1 || heldFrameCount % 30 == 0 {
+                logger.info(
+                    "Held-last-frame emit #\(self.heldFrameCount, privacy: .public)"
+                )
+            }
+        } else {
+            placeholderFrameCount += 1
+            if placeholderFrameCount == 1 || placeholderFrameCount % 30 == 0 {
+                logger.info(
+                    "No-signal placeholder emit #\(self.placeholderFrameCount, privacy: .public) mode=\(self.noSignalFrames.mode.rawValue, privacy: .public)"
+                )
+            }
         }
     }
 

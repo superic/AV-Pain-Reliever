@@ -82,7 +82,7 @@ let package = Package(
         // map/copy/persist helpers under unit-test coverage.
         .testTarget(
             name: "AVPainRelieverAppTests",
-            dependencies: ["AVPainRelieverApp"]
+            dependencies: ["AVPainRelieverApp", "AVPainRelieverSharedConstants"]
         ),
         // Camera Extension binary. Imports CoreMediaIO directly; no
         // dependency on AVPainReliever or AVPainRelieverApp — the

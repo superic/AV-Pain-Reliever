@@ -32,4 +32,11 @@ public enum CameraExtensionNotifications {
     /// transition can seed its initial state.
     public static let queryConsumerState =
         "HLH4LEWS9S.com.ericwillis.avpainreliever.query-consumer-state"
+
+    /// Posted by the host after it writes a new `NoSignalMode` into
+    /// the shared App Group container. Carries no payload — Darwin
+    /// notifications can't — so it means only "re-read the key".
+    /// See `NoSignalSharedStore`.
+    public static let noSignalModeChanged =
+        "HLH4LEWS9S.com.ericwillis.avpainreliever.no-signal-mode-changed"
 }

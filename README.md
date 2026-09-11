@@ -86,6 +86,8 @@ To enable:
 
 **Settings… → Camera** also shows a live preview of what the virtual camera is sending, with a one-line readout underneath ("Relaying 30 fps from …"), so you can confirm the feed is healthy without starting a call. The preview runs only while that tab is open.
 
+If the camera you picked isn't sending a picture yet — still warming up, or switched off — the virtual camera shows a plain black screen rather than freezing on whatever it last saw. **Settings… → Camera** lets you swap that for a test-pattern or static look instead, if you'd rather see something else while it's dark.
+
 To turn it off, flip the toggle back. The "AV Pain Reliever" entry stops showing up in those apps' camera lists.
 
 ---

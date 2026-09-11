@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import AVPainReliever
+import AVPainRelieverSharedConstants
 
 /// User-tunable behavior toggles. Persisted to `UserDefaults` under the
 /// app's domain so settings survive relaunches without us writing
@@ -37,6 +38,7 @@ final class SettingsStore: ObservableObject {
         static let rememberedAudioOutputs = "rememberedAudioOutputs"
         static let rememberedCameras = "rememberedCameras"
         static let ignoredLocations = "ignoredLocations"
+        static let noSignalMode = "noSignalMode"
     }
 
     /// Toast on profile change?  Default on — the at-a-glance signal
@@ -119,6 +121,26 @@ final class SettingsStore: ObservableObject {
     /// the actual state transitions.
     @Published var virtualCameraEnabled: Bool {
         didSet { write(virtualCameraEnabled, forKey: Key.virtualCameraEnabled) }
+    }
+
+    /// What the virtual camera shows when the real camera has gone
+    /// dry past the hold window (see `NoSignalPolicy`). Default is
+    /// `.black` — a settled product decision (issue #125): on a live
+    /// call it reads as "camera isn't on yet," and it puts no novelty
+    /// graphic on a colleague's screen. Test pattern and static noise
+    /// are opt-in, more diagnostic/fun than a sane default.
+    ///
+    /// The extension can't see `UserDefaults.standard` — it's a
+    /// separate sandboxed process — so every change (and one pass at
+    /// host startup, in `init` below) is mirrored into the shared App
+    /// Group container via `publishNoSignalMode`, which also pings
+    /// the extension to re-read it. See that property for why it's
+    /// injected rather than called statically.
+    @Published var noSignalMode: NoSignalMode {
+        didSet {
+            write(noSignalMode.rawValue, forKey: Key.noSignalMode)
+            publishNoSignalMode(noSignalMode)
+        }
     }
 
     /// Opt-in to updates from the `dev` Sparkle channel. Default off.
@@ -337,12 +359,23 @@ final class SettingsStore: ObservableObject {
     /// main-actor state.
     private let applyLoginItem: LoginItemApplier
 
+    /// Closure invoked from `noSignalMode.didSet` (and once at
+    /// startup, in `init`) to mirror the value into the App Group
+    /// container and ping the Camera Extension. Production passes
+    /// `NoSignalModePublisher.publish`; tests pass a no-op so
+    /// `swift test` never writes into the real shared container or
+    /// posts a real Darwin notification a live extension might act
+    /// on. Same seam, same rationale as `applyLoginItem` above.
+    private let publishNoSignalMode: NoSignalModePublishing
+
     init(
         defaults: UserDefaults = .standard,
-        applyLoginItem: @escaping LoginItemApplier = LaunchAtLogin.apply(enabled:)
+        applyLoginItem: @escaping LoginItemApplier = LaunchAtLogin.apply(enabled:),
+        publishNoSignalMode: @escaping NoSignalModePublishing = NoSignalModePublisher.publish
     ) {
         self.defaults = defaults
         self.applyLoginItem = applyLoginItem
+        self.publishNoSignalMode = publishNoSignalMode
         // Default-on toggles use `object(forKey:) == nil` to distinguish
         // "never set" (use default) from "set to false" (respect
         // user's choice). `bool(forKey:)` returns false for missing
@@ -356,6 +389,13 @@ final class SettingsStore: ObservableObject {
         self.suppressedWelcome = (defaults.object(forKey: Key.suppressedWelcome) as? Bool) ?? false
         self.launchAtLogin = (defaults.object(forKey: Key.launchAtLogin) as? Bool) ?? false
         self.virtualCameraEnabled = (defaults.object(forKey: Key.virtualCameraEnabled) as? Bool) ?? false
+        // Lazy-default rule (CLAUDE.md): read with `object(forKey:) as?
+        // String` and parse, never `string(forKey:)`, and never write
+        // the default here. An unparsable stored string (a future
+        // build removes a case, a hand-edited `defaults write`) falls
+        // back to `.black` rather than crashing.
+        self.noSignalMode = (defaults.object(forKey: Key.noSignalMode) as? String)
+            .flatMap(NoSignalMode.init(rawValue:)) ?? .black
         self.experimentalUpdates = (defaults.object(forKey: Key.experimentalUpdates) as? Bool) ?? false
         self.devUpdates = (defaults.object(forKey: Key.devUpdates) as? Bool) ?? false
         // Stats tracking ships off by default for privacy. Every
@@ -374,6 +414,25 @@ final class SettingsStore: ObservableObject {
         self.rememberedAudioOutputs = (defaults.object(forKey: Key.rememberedAudioOutputs) as? [String: [String]]) ?? [:]
         self.rememberedCameras = (defaults.object(forKey: Key.rememberedCameras) as? [String: [String]]) ?? [:]
         self.ignoredLocations = Self.readIgnoredLocations(from: defaults)
+    }
+
+    /// Mirror the current mode into the shared container without
+    /// changing it.
+    ///
+    /// `noSignalMode`'s `didSet` doesn't fire for its own initial
+    /// assignment inside `init` (Swift never calls property observers
+    /// there), so a host that starts up and never touches the setting
+    /// would leave the extension reading whatever the container last
+    /// held. `AppDelegate` calls this once at launch to close that
+    /// gap.
+    ///
+    /// Deliberately NOT called from `init`: constructing a store is
+    /// not an event, and a constructor that reaches outside the
+    /// process makes every test that builds a store — including ones
+    /// with no interest in this setting — write to the real App Group
+    /// container and post a live Darwin notification.
+    func publishNoSignalModeToExtension() {
+        publishNoSignalMode(noSignalMode)
     }
 
     /// Look up whether a canonical location fingerprint is on the
