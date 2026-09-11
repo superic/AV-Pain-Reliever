@@ -802,5 +802,24 @@
                        type="application/octet-stream"
                        sparkle:edSignature="OoWNvyIGzadfg6z8qUap8WlCaKO6/XuWHdyLob0nCA70m2jpd+xVl1570EAeAnzI0tAHCyN6X3abn4JBaeo1CQ==" length="3381295" />
         </item>
+        <item>
+            <title>Version 0.2.0.23-dev.1</title>
+            <description><![CDATA[
+<h2>What's new</h2>
+<p>Here's a thing nobody should have to explain to a room full of coworkers: why there's a frozen picture of you on the screen while you're sitting right there, live, waving. That was us. The virtual camera would grab the last good frame it ever saw and just hold it. Indefinitely. Camera switch still off at the top of a call? Congratulations, everybody's looking at you from last Tuesday.</p>
+<p>Fixed. When your camera isn't sending a picture, the virtual camera now shows a placeholder instead of a souvenir. <strong>Black by default</strong>, because on a real call black reads as "camera's not on yet," which is precisely what's happening, and nobody needs a light show at 9am. If you want something with more personality, <strong>Settings → Camera</strong> has two more: a proper broadcast test pattern with the colour bars, and honest-to-goodness analogue static — the animated kind, the kind that used to mean the station went to bed.</p>
+<p>The part that actually matters is quieter. A frame from an earlier call can't follow you into a new one anymore. The instant an app opens the camera, whatever was cached is gone. Not aged out, not timed out — gone before anyone could see it. Different thing entirely, and the reason this is a fix rather than a feature.</p>
+<p>While we were in there, the status row in Settings → Camera learned to stop flattering itself. A green "relaying" line now means your actual camera is feeding the thing, not merely that pixels are moving. The placeholder gets its own row and says so in plain words, so "it's working" and "it's showing you a black rectangle on purpose" never look the same again.</p>
+<p>This one's riding the dev track. Kick the tyres. Money.</p>
+]]></description>
+            <pubDate>Fri, 11 Sep 2026 18:30:42 +0000</pubDate>
+            <sparkle:channel>dev</sparkle:channel>
+            <sparkle:version>0.2.0.23-dev.1</sparkle:version>
+            <sparkle:shortVersionString>0.2.0.23-dev.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/superic/av-pain-reliever/releases/download/v0.2.0.23-dev.1/AVPainReliever.app.zip"
+                       type="application/octet-stream"
+                       sparkle:edSignature="WboBffQJl0LKppY47Ry/DoqtUuznYoRcIxNOBAWMs2AVuAPwA+WL/BjMAeow/KkhUbPvpfXnTgZyHsGl4kAfAQ==" length="3442314" />
+        </item>
     </channel>
 </rss>
